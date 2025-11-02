@@ -2,16 +2,17 @@
 import time
 import statistics
 import requests
+import os
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from datetime import datetime, timedelta
 
-# ================== SETTINGS (DOLLDUR) ==================
-API_KEY = "oHeARDfSi6TIf6noEtCjwea47whzgMsb7N0zLXpeUuydD0Q2AdTbY3W1VzbQNbse"
-API_SECRET = "znctIrYzyTtG5SfT32q1zpeZdijvKjjQL3A7fBOoPgMEAETUsTK6IlvTKroMcZc9"
+# ================== SETTINGS ==================
+API_KEY = os.environ.get("BINANCE_API_KEY", "")
+API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
 
-TELEGRAM_BOT_TOKEN = "8040851077:AAH5Q6umeRCQgL2CjirZ5XnpnEEvWh8vz_Q"
-TELEGRAM_CHAT_ID = "1844196910"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Strategy params
 THRESHOLD = 0.05                    # 5% price change threshold (absolute)
