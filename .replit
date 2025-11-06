@@ -1,9 +1,8 @@
+run = "python scanner_telegram.py"
 modules = ["python-3.11"]
+
 [agent]
 expertMode = true
-
-[nix]
-channel = "stable-25_05"
 
 [workflows]
 runButton = "Project"
@@ -27,3 +26,7 @@ args = "python scanner_telegram.py"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[ports]]
+localPort = 8080
+externalPort = 80
