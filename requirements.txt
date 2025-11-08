@@ -1,4 +1,6 @@
+python-binance==1.0.19
 requests
-python-binance
-pyTelegramBotAPI
-binance
+flask
+matplotlib
+numpy
+websocket-client

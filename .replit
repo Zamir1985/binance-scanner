@@ -1,32 +1,26 @@
-run = "python scanner_telegram.py"
+run = "python3 scanner_telegram.py"
 modules = ["python-3.11"]
 
-[agent]
-expertMode = true
-
-[workflows]
-runButton = "Project"
-
-[[workflows.workflow]]
-name = "Project"
-mode = "parallel"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "Scanner"
-
-[[workflows.workflow]]
-name = "Scanner"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "python scanner_telegram.py"
-
-[workflows.workflow.metadata]
-outputType = "console"
+[env]
+BINANCE_API_KEY = "oHeARDfSi6TIf6noEtCjwea47whzgMsb7N0zLXpeUuydD0Q2AdTbY3W1VzbQNbse"
+BINANCE_API_SECRET = "znctIrYzyTtG5SfT32q1zpeZdijvKjjQL3A7fBOoPgMEAETUsTK6IlvTKroMcZc9"
+TELEGRAM_BOT_TOKEN = "8040851077:AAH5Q6umeRCQgL2CjirZ5XnpnEEvWh8vz_Q"
+TELEGRAM_CHAT_ID = "1844196910"
 
 [[ports]]
 localPort = 8080
 externalPort = 80
+
+[[ports]]
+localPort = 8081
+externalPort = 8081
+
+[[ports]]
+localPort = 8082
+externalPort = 3000
+
+[nix]
+packages = ["cairo", "ffmpeg-full", "freetype", "ghostscript", "gobject-introspection", "gtk3", "pkg-config", "qhull", "tcl", "tk"]
+
+[agent]
+expertMode = true
