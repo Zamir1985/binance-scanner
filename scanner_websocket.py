@@ -90,7 +90,7 @@ LOG_ENABLED = True
 LOG_FILE = os.getenv("SIGNAL_LOG_FILE", "signals.log")
 
 WATCHDOG_ENABLED = True
-WATCHDOG_NO_MSG_TIMEOUT = int(os.getenv("WATCHDOG_NO_MSG_TIMEOUT", "900"))  # 15 dəq
+WATCHDOG_NO_MSG_TIMEOUT = int(os.getenv("WATCHDOG_NO_MSG_TIMEOUT", "1800"))  # 30 dəq
 WATCHDOG_MIN_UPTIME = 300  # ilk 5 dəqiqədə restart etməsin
 
 # ============================================================
@@ -1383,29 +1383,40 @@ def heartbeat_loop():
             if last_heartbeat_ts == 0:
                 last_heartbeat_ts = now
 
+            # interval dolubsa
             if now - last_heartbeat_ts >= HEARTBEAT_INTERVAL:
-                uptime = now - START_TIME
-                active = sum(1 for s in tracked_syms if last_seen.get(s, 0) > now - 90)
-                total = len(tracked_syms)
-                last_msg_age = now - last_any_msg_ts if last_any_msg_ts > 0 else None
+                # gecə saatlarıdırsa – heartbeat göndərmə
+                if is_silent_hour(now):
+                    print("Heartbeat skipped (silent hours).")
+                else:
+                    uptime = now - START_TIME
+                    active = sum(1 for s in tracked_syms if last_seen.get(s, 0) > now - 90)
+                    total = len(tracked_syms)
+                    last_msg_age = now - last_any_msg_ts if last_any_msg_ts > 0 else None
 
-                ws_status = "OK ✅" if ws_manager is not None else "NONE ⚠️"
+                    ws_status = "OK" if ws_manager is not None else "NONE"
 
-                hb_text = (
-                    "🤖 Scanner Alive (Railway)\n"
-                    f"Tracked pairs: {total}\n"
-                    f"Active (last 90s): {active}\n"
-                    f"Uptime: {format_uptime(uptime)}\n"
-                    f"WS: {ws_status}\n"
-                    f"Last tick age: {int(last_msg_age)}s" if last_msg_age is not None else "Last tick age: N/A"
-                )
+                    # daha yığcam heartbeat
+                    hb_text = (
+                        f"🤖 Alive | pairs {total} ({active} active) | "
+                        f"uptime {format_uptime(uptime)} | "
+                        f"WS {ws_status} | "
+                        f"last tick {int(last_msg_age)}s"
+                        if last_msg_age is not None
+                        else f"🤖 Alive | pairs {total} ({active} active) | "
+                             f"uptime {format_uptime(uptime)} | "
+                             f"WS {ws_status} | last tick N/A"
+                    )
 
-                send_telegram(hb_text)
+                    send_telegram(hb_text)
+
+                # interval yenilənir (silent hour olsa da, vaxtı sıfırlayaq ki, flood olmasın)
                 last_heartbeat_ts = now
 
             time.sleep(15)
         except Exception as e:
             print("heartbeat_loop error:", e)
+            notify_error("heartbeat_loop", e)
             time.sleep(30)
 
 # ============================================================
@@ -1428,18 +1439,22 @@ def watchdog_loop():
 
             if idle > WATCHDOG_NO_MSG_TIMEOUT and uptime > WATCHDOG_MIN_UPTIME:
                 msg = (
-                    f"⚠ Watchdog: no miniticker for {int(idle)}s, "
-                    f"uptime {format_uptime(uptime)} — restarting scanner (Railway will respawn)."
+                    f"🟥 CRITICAL: Watchdog — no miniticker for {int(idle)}s, "
+                    f"uptime {format_uptime(uptime)}. "
+                    f"Exiting so Railway restarts."
                 )
                 print(msg)
                 try:
+                    # CRITICAL alert – silent hours-ı bypass edirik
                     send_telegram(msg)
-                except:
-                    pass
+                except Exception as te:
+                    print("watchdog telegram error:", te)
+
                 os._exit(1)
 
         except Exception as e:
             print("watchdog_loop error:", e)
+            notify_error("watchdog_loop", e)
 
         time.sleep(60)
 
