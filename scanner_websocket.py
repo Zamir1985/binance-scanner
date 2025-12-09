@@ -58,6 +58,9 @@ FAKE_VOLUME_STRENGTH = 1.5      # volume_strength >= 1.2
 FAKE_RECENT_MIN_USDT = 2000     # recent_1m >= 2000
 FAKE_RECENT_STRONG_USDT = 10000 # vol_mult <= 50 OR recent_1m >= 10k
 
+# Momentum pattern threshold (Pattern Summary üçün)
+MOMENTUM_THRESHOLD = START_PCT
+
 # Existing unchanged:
 MIN24H = 2_000_000
 
@@ -642,6 +645,287 @@ def compute_wce(
         return 50, "UNKNOWN", "MEDIUM", "LOW", "\n🔥 Wave Confirmation: unavailable"
 
 # ============================================================
+# PATTERN-BASED SENTIMENT ENGINE (Variant C)
+# ============================================================
+
+def generate_pattern_analysis(
+    metrics,
+    price_pct,
+    rsi=None,
+    rsi_3m=None,
+    ob_ratio=None,
+    ob_label=None,
+    stage_label=None,
+    mode="full"
+):
+    """
+    Pattern-based analiz:
+    • OI Pattern
+    • Pro Traders bias
+    • Retail bias
+    • Global sentiment
+    • Momentum context
+    • Price vs OI divergence
+    + Trend Verdict + Fake-out risk + Squeeze probability + Final Confirmation
+    mode = "full" / "short" / "exit"
+    """
+    try:
+        def to_float(val, default=None):
+            try:
+                if val in ["-", None]:
+                    return default
+                return float(val)
+            except Exception:
+                return default
+
+        oi_chg = to_float(metrics.get("oi_chg"), 0.0)
+        not_chg = to_float(metrics.get("not_chg"), 0.0)
+        acc_r = to_float(metrics.get("acc_r"), None)
+        pos_r = to_float(metrics.get("pos_r"), None)
+        glb_r = to_float(metrics.get("glb_r"), None)
+        fund_chg = to_float(metrics.get("funding_change"), 0.0)
+
+        price_pct = price_pct or 0.0
+        abs_p = abs(price_pct)
+
+        # ----- OI Pattern -----
+        if oi_chg is None:
+            oi_label = "Flat / unknown"
+        elif oi_chg > 2:
+            oi_label = "Increasing (leverage coming in)"
+        elif oi_chg < -2:
+            oi_label = "Decreasing (positions closing)"
+        else:
+            oi_label = "Stable / sideway"
+
+        # ----- Pro Traders (Pos L/S) -----
+        if pos_r is None:
+            pro_label = "Neutral / unknown"
+        elif pos_r > 1.1:
+            pro_label = "Long-biased (Pos L/S > 1)"
+        elif pos_r < 0.9:
+            pro_label = "Short-biased (Pos L/S < 1)"
+        else:
+            pro_label = "Balanced"
+
+        # ----- Retail (Acct L/S) -----
+        if acc_r is None:
+            retail_label = "Neutral / unknown"
+        elif acc_r > 1.1:
+            retail_label = "Long-heavy (FOMO risk)"
+        elif acc_r < 0.9:
+            retail_label = "Short-heavy (squeeze fuel)"
+        else:
+            retail_label = "Balanced / mixed"
+
+        # ----- Global sentiment -----
+        if glb_r is None:
+            global_label = "Neutral"
+        elif glb_r > 1.05:
+            global_label = "Bullish-leaning"
+        elif glb_r < 0.95:
+            global_label = "Bearish-leaning"
+        else:
+            global_label = "Neutral"
+
+        # ----- Momentum Context -----
+        if abs_p < MOMENTUM_THRESHOLD * 0.5:
+            momentum_label = "Weak / choppy"
+        elif abs_p < MOMENTUM_THRESHOLD * 1.2:
+            momentum_label = "Building"
+        else:
+            momentum_label = "Strong move"
+
+        # ----- Price vs OI divergence -----
+        if price_pct > 0 and oi_chg is not None and oi_chg < 0:
+            divergence_label = "Price↑ & OI↓ → Short squeeze potential"
+            squeeze_bias = 2
+        elif price_pct < 0 and oi_chg is not None and oi_chg > 0:
+            divergence_label = "Price↓ & OI↑ → Leverage trap / breakdown risk"
+            squeeze_bias = -1
+        else:
+            divergence_label = "Price & OI aligned"
+            squeeze_bias = 0
+
+        # ----- Trend direction (bias) -----
+        if price_pct > 0:
+            bias = "LONG"
+            trend_dir_label = "Bullish"
+        elif price_pct < 0:
+            bias = "SHORT"
+            trend_dir_label = "Bearish"
+        else:
+            bias = "NONE"
+            trend_dir_label = "Sideways"
+
+        # ----- Fake-out risk score -----
+        fake_score = 0
+
+        # Retail FOMO aynı tərəfdədirsə risk artır
+        if bias == "LONG" and acc_r is not None and acc_r > 1.1 and glb_r is not None and glb_r > 1.05:
+            fake_score += 2
+        if bias == "SHORT" and acc_r is not None and acc_r < 0.9 and glb_r is not None and glb_r < 0.95:
+            fake_score += 2
+
+        # OI dəstəyi zəif, amma price böyük hərəkət edibsə
+        if abs_p >= THRESHOLD and (oi_chg is not None and abs(oi_chg) < 1.0):
+            fake_score += 1
+
+        # Squeeze bullish divergence riskdən çox qazancdır → risk azaldır
+        if squeeze_bias > 0 and bias == "LONG":
+            fake_score = max(fake_score - 1, 0)
+
+        if fake_score <= 0:
+            fake_label = "LOW"
+        elif fake_score <= 2:
+            fake_label = "MEDIUM"
+        else:
+            fake_label = "HIGH"
+
+        # ----- Squeeze probability -----
+        squeeze_prob = "LOW"
+        if (
+            price_pct > 0
+            and oi_chg is not None and oi_chg <= 0
+            and acc_r is not None and acc_r < 0.9
+            and glb_r is not None and glb_r < 0.9
+        ):
+            squeeze_prob = "HIGH"
+        elif squeeze_bias > 0:
+            squeeze_prob = "MEDIUM"
+
+        # ----- Final Confirmation score (0–100) -----
+        score = 0.0
+
+        # Price move baza
+        score += min(abs_p / THRESHOLD, 2.0) * 20  # max ~40
+
+        # OI alignment
+        if oi_chg is not None:
+            same_dir = (price_pct > 0 and oi_chg > 0) or (price_pct < 0 and oi_chg < 0)
+            if same_dir:
+                score += 20
+            elif squeeze_bias != 0:
+                score += 10
+
+        # Pro alignment
+        if bias == "LONG" and pos_r is not None and pos_r > 1.05:
+            score += 15
+        if bias == "SHORT" and pos_r is not None and pos_r < 0.95:
+            score += 15
+
+        # Retail contrarian bonus
+        if bias == "LONG" and acc_r is not None and acc_r < 0.9:
+            score += 10
+        if bias == "SHORT" and acc_r is not None and acc_r > 1.1:
+            score += 10
+
+        # Momentum bonus
+        if momentum_label == "Strong move":
+            score += 10
+
+        # Fake-out penalty
+        if fake_label == "HIGH":
+            score -= 20
+        elif fake_label == "MEDIUM":
+            score -= 5
+
+        score = max(0, min(int(round(score)), 100))
+
+        # Bias icon + NO-TRADE rejimi
+        if score < 40 or bias == "NONE":
+            final_bias = "NO TRADE"
+            icon = "🟧"
+        else:
+            final_bias = bias
+            icon = "🟢" if bias == "LONG" else "🔴"
+
+        # ----- Trend Verdict text -----
+        if trend_dir_label == "Bullish":
+            if momentum_label == "Strong move":
+                verdict = "Bullish & Strong"
+            elif momentum_label == "Weak / choppy":
+                verdict = "Bullish but Weak"
+            else:
+                verdict = "Bullish (developing)"
+        elif trend_dir_label == "Bearish":
+            if momentum_label == "Strong move":
+                verdict = "Bearish & Strong"
+            elif momentum_label == "Weak / choppy":
+                verdict = "Bearish but Weak"
+            else:
+                verdict = "Bearish (developing)"
+        else:
+            verdict = "Sideways / No clear trend"
+
+        # ----- Reason line -----
+        reasons = []
+        if oi_chg is not None:
+            if price_pct > 0 and oi_chg > 0:
+                reasons.append("OI↑ + Price↑ (real trend)")
+            elif price_pct < 0 and oi_chg < 0:
+                reasons.append("OI↓ + Price↓ (real unwinding)")
+        if pos_r is not None:
+            if bias == "LONG" and pos_r > 1.05:
+                reasons.append("pro accumulation")
+            if bias == "SHORT" and pos_r < 0.95:
+                reasons.append("pro short bias")
+        if acc_r is not None:
+            if acc_r > 1.1:
+                reasons.append("retail FOMO same side")
+            elif acc_r < 0.9:
+                reasons.append("retail opposite (squeeze fuel)")
+        if ob_ratio is not None and ob_label:
+            if ob_ratio > 1.3 and bias == "LONG":
+                reasons.append("bid-side orderbook support")
+            if ob_ratio < (1/1.3) and bias == "SHORT":
+                reasons.append("ask-side orderbook pressure")
+
+        if not reasons:
+            reasons.append("mixed sentiment, low conviction")
+
+        reason_line = ", ".join(reasons)
+
+        # ----- Build text block according to mode -----
+
+        lines = ["\n📊 PATTERN SUMMARY"]
+
+        # full / short / exit selectable
+        if mode == "full":
+            lines.append(f"• OI Pattern: {oi_label}")
+            lines.append(f"• Pro Traders: {pro_label}")
+            lines.append(f"• Retail: {retail_label}")
+            lines.append(f"• Global Sentiment: {global_label}")
+            lines.append(f"• Momentum Context: {momentum_label}")
+            lines.append(f"• Divergence: {divergence_label}")
+        elif mode == "short":
+            lines.append(f"• OI: {oi_label}")
+            lines.append(f"• Pro: {pro_label}")
+            lines.append(f"• Retail: {retail_label}")
+            lines.append(f"• Divergence: {divergence_label}")
+        elif mode == "exit":
+            lines.append(f"• OI: {oi_label}")
+            lines.append(f"• Retail: {retail_label}")
+            lines.append(f"• Divergence: {divergence_label}")
+
+        # Trend Verdict + risk + squeeze
+        lines.append(f"\n🎯 TREND VERDICT: {verdict}")
+        lines.append(f"Fake-out risk: {fake_label}")
+        lines.append(f"Squeeze probability: {squeeze_prob}")
+
+        # Final confirmation
+        lines.append("\n🔮 FINAL CONFIRMATION:")
+        lines.append(f"{icon} {final_bias} — {score}%")
+        lines.append(f"Reason: {reason_line}")
+
+        block = "\n".join(lines)
+        return block
+
+    except Exception as e:
+        print("generate_pattern_analysis error:", e)
+        return ""
+
+# ============================================================
 # TELEGRAM
 # ============================================================
 
@@ -831,6 +1115,18 @@ def maybe_send_exit_and_reverse(
 
     reasons_text = "\n".join(f"• {r}" for r in reasons)
 
+    # Pattern snapshot (short)
+    pattern_block = generate_pattern_analysis(
+        metrics,
+        pct_15m,
+        rsi=rsi,
+        rsi_3m=rsi3m,
+        ob_ratio=ob_ratio,
+        ob_label=ob_label,
+        stage_label=stage_label,
+        mode="exit"
+    )
+
     caption = (
         "⚠ EXIT SIGNAL\n"
         f"{symbol}\n\n"
@@ -844,7 +1140,8 @@ def maybe_send_exit_and_reverse(
         f"Orderbook: {ob_label}\n"
         f"24h Volume: {int(vol24):,} USDT\n"
         f"Signal Quality: {signal_q}/100\n"
-        f"WCE Score: {wce_score}%\n\n"
+        f"WCE Score: {wce_score}%\n"
+        f"{pattern_block}\n\n"
         f"Reasons:\n{reasons_text}\n\n"
         f"{reverse_note}\n"
         f"{wce_text}\n"
@@ -1145,6 +1442,18 @@ def _process_mini(msg):
                     ob_ratio=ob_ratio
                 )
 
+                # Pattern (short) for STEP
+                pattern_block = generate_pattern_analysis(
+                    metrics,
+                    pct_15m,
+                    rsi=rsi,
+                    rsi_3m=rsi3m,
+                    ob_ratio=ob_ratio,
+                    ob_label=ob_label,
+                    stage_label=stage_label,
+                    mode="short"
+                )
+
                 vol24 = get_24h_volume_cached(symbol)
 
                 caption = (
@@ -1163,6 +1472,7 @@ def _process_mini(msg):
                     f"📉 RSI(3m): {rsi3m} ({rsi3m_trend})\n"
                     f"📊 Orderbook: {ob_label}\n"
                     f"{sentiment_text}\n"
+                    f"{pattern_block}\n"
                     f"🔍 Signal Quality: {signal_q}/100 ({get_score_level(signal_q)})\n\n"
                     f"{wce_text}"
                 )
@@ -1271,8 +1581,20 @@ def _process_mini(msg):
                     metrics.get("funding_change", 0.0),
                     rsi,
                     pct_15m,
-                    rsi_3m=rsi3m if rsi3m is not None else 50.0,
+                    rsi3m=rsi3m if rsi3m is not None else 50.0,
                     ob_ratio=ob_ratio
+                )
+
+                # FULL Pattern Engine for START
+                pattern_block = generate_pattern_analysis(
+                    metrics,
+                    pct_15m,
+                    rsi=rsi,
+                    rsi_3m=rsi3m,
+                    ob_ratio=ob_ratio,
+                    ob_label=ob_label,
+                    stage_label=stage_label,
+                    mode="full"
                 )
 
                 caption = (
@@ -1290,6 +1612,7 @@ def _process_mini(msg):
                     f"📉 RSI(3m): {rsi3m} ({rsi3m_trend})\n"
                     f"📊 Orderbook: {ob_label}\n"
                     f"{sentiment_text}\n"
+                    f"{pattern_block}\n"
                     f"🔍 Signal Quality: {signal_q}/100 ({get_score_level(signal_q)})\n\n"
                     f"{wce_text}"
                 )
@@ -1580,3 +1903,4 @@ if __name__ == "__main__":
     # Railway-də main thread boş qalmamalıdır (container yoxsa ölür)
     while True:
         time.sleep(5)
+        
