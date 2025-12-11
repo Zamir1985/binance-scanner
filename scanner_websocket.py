@@ -51,10 +51,10 @@ last_heartbeat_ts = 0.0
 
 # --- PRO START CONFIG ---
 START_PCT = 5.0                 # 15m price change threshold
-START_VOLUME_SPIKE = 3.0        # vol_mult minimum
-START_MICRO_PCT = 0.05          # short_pct minimum (micro impulse)
+START_VOLUME_SPIKE = 2.0        # vol_mult minimum
+START_MICRO_PCT = 0.03          # short_pct minimum (micro impulse)
 
-FAKE_VOLUME_STRENGTH = 1.5      # volume_strength >= 1.2
+FAKE_VOLUME_STRENGTH = 1.3       # volume_strength >= 1.2
 FAKE_RECENT_MIN_USDT = 2000     # recent_1m >= 2000
 FAKE_RECENT_STRONG_USDT = 10000 # vol_mult <= 50 OR recent_1m >= 10k
 
@@ -1910,3 +1910,4 @@ if __name__ == "__main__":
     # Railway-də main thread boş qalmamalıdır (container yoxsa ölür)
     while True:
         time.sleep(5)
+
