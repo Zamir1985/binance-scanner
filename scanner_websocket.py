@@ -1,9 +1,11 @@
 # ============================================================
-#   Binance Futures Scanner — Railway Version
+#   Binance Futures Scanner — Railway Version (PRO Variant B)
 #   START / STEP / EXIT / REVERSE — FULL ORIGINAL LOGIC
 #   + Heartbeat (Alive ping to Telegram)
 #   + Signal Logging (START / STEP / EXIT / REVERSE)
 #   + Watchdog (auto-restart if data stops)
+#   + PRO WS/CPU Layer: miniticker callback yüngülləşdirilib,
+#     ağır _process_mini ayrıca worker thread-də işləyir.
 #   7/24 stable Railway execution
 # ============================================================
 
@@ -45,6 +47,12 @@ last_any_msg_ts = 0.0
 last_start_ts = 0.0
 last_heartbeat_ts = 0.0
 
+# --- PRO WS/CPU LAYER STATE ---
+# WebSocket callback indi yalnız son msg-i buffer-ə yazır,
+# ağır _process_mini isə ayrıca worker thread-də işləyir.
+mini_buffer = {}
+mini_lock = threading.Lock()
+
 # ============================================================
 # CONFIG (UNCHANGED + NEW FEATURES)
 # ============================================================
@@ -54,7 +62,7 @@ START_PCT = 5.0                 # 15m price change threshold
 START_VOLUME_SPIKE = 2.0        # vol_mult minimum
 START_MICRO_PCT = 0.03          # short_pct minimum (micro impulse)
 
-FAKE_VOLUME_STRENGTH = 1.3       # volume_strength >= 1.2
+FAKE_VOLUME_STRENGTH = 1.3      # volume_strength >= 1.2
 FAKE_RECENT_MIN_USDT = 2000     # recent_1m >= 2000
 FAKE_RECENT_STRONG_USDT = 10000 # vol_mult <= 50 OR recent_1m >= 10k
 
@@ -1192,7 +1200,7 @@ def maybe_send_exit_and_reverse(
     entry["last_signal_q"] = signal_q
 
 # ============================================================
-# WEBSOCKET CORE: _process_mini + handle_miniticker
+# WEBSOCKET CORE: _process_mini + handle_miniticker (PRO Layer)
 # ============================================================
 
 ws_manager = None  # active ThreadedWebsocketManager instance
@@ -1213,6 +1221,8 @@ def get_score_level(score: int) -> str:
 def _process_mini(msg):
     """
     Binance miniticker mesajı üçün core START / STEP / EXIT məntiqi.
+    PRO LAYER: Bu funksiya artıq birbaşa WebSocket callback-də deyil,
+    ayrıca mini_worker_loop thread-i tərəfindən çağırılır.
     """
     global last_log, last_any_msg_ts, last_start_ts
 
@@ -1221,7 +1231,7 @@ def _process_mini(msg):
         return
 
     now = time.time()
-    last_any_msg_ts = now  # hər gələn miniticker-də yenilə
+    last_any_msg_ts = now  # işlənən son tick timestamp
 
     # ----------- LOG LIMIT (console izləmə) -----------
     if now - last_log > 2:
@@ -1445,7 +1455,7 @@ def _process_mini(msg):
                     metrics.get("funding_change", 0.0),
                     rsi,
                     pct_15m,
-                    rsi_3m=rsi3m if rsi3m is not None else 50.0,
+                    rsi3m=rsi3m if rsi3m is not None else 50.0,
                     ob_ratio=ob_ratio
                 )
 
@@ -1656,9 +1666,27 @@ def _process_mini(msg):
         print("process_mini error:", e, "| msg:", short)
 
 
+def _ingest_mini(msg):
+    """
+    PRO WS LAYER:
+    WebSocket callback artıq yalnız bu funksiyanı çağırır.
+    Bu funksiya sadəcə son msg-i per-symbol buffer-də saxlayır.
+    Ağır _process_mini işləməsi isə ayrıca mini_worker_loop thread-də.
+    """
+    symbol = msg.get("s") or msg.get("symbol")
+    if not symbol:
+        return
+    now = time.time()
+    # Burada sadəcə son mesajı saxlayırıq (bir symbol üçün).
+    with mini_lock:
+        mini_buffer[symbol] = msg
+
+
 def handle_miniticker(msg):
     """
     Accept either a dict (single symbol) or a list of dicts (bulk).
+    PRO LAYER: WS callback burada yalnız _ingest_mini çağırır,
+    ağır iş mini_worker_loop-da görülür.
     """
     try:
         if msg is None:
@@ -1667,14 +1695,35 @@ def handle_miniticker(msg):
         if isinstance(msg, (list, tuple)):
             for item in msg:
                 if isinstance(item, dict):
-                    _process_mini(item)
+                    _ingest_mini(item)
         elif isinstance(msg, dict):
-            _process_mini(msg)
+            _ingest_mini(msg)
         else:
             print("handle_miniticker: unexpected msg type", type(msg))
 
     except Exception as e:
         print("handle_miniticker wrapper error:", e)
+
+
+def mini_worker_loop(interval=0.5):
+    """
+    PRO CPU/WS Layer:
+    Hər interval-da (default 0.5s) buffer-də toplanan son miniticker-ləri götürür
+    və _process_mini ilə işləyir.
+    Eyni symbol üçün yalnız ən son msg işlənir → WS overload və CPU yükü düşür.
+    """
+    global mini_buffer
+    while True:
+        try:
+            with mini_lock:
+                # yalnız son mesajları götür (values kifayətdir)
+                items = list(mini_buffer.values())
+                mini_buffer = {}
+            for msg in items:
+                _process_mini(msg)
+        except Exception as e:
+            print("mini_worker_loop error:", e)
+        time.sleep(interval)
 
 # ============================================================
 # WEBSOCKET MONITOR — Railway Stable Version
@@ -1892,22 +1941,23 @@ def heartbeat(interval_minutes=30):
 # ============================================================
 
 if __name__ == "__main__":
-    print("\n📡 SCANNER STARTING (Railway Mode)...\n")
+    print("\n📡 SCANNER STARTING (Railway Mode, PRO WS/CPU Variant B)...\n")
 
     try:
         threading.Thread(target=start_stream, daemon=True).start()
         threading.Thread(target=heartbeat_loop, daemon=True).start()
         threading.Thread(target=watchdog_loop, daemon=True).start()
+        # PRO: mini_worker_loop ayrıca thread-də ağır _process_mini-ni icra edir
+        threading.Thread(target=mini_worker_loop, daemon=True).start()
     except Exception as e:
         print("❌ Failed to start background threads:", e)
 
     # 🔔 BURADA BİR DƏFƏLİK TEST MESAJI GÖNDƏR
     try:
-        send_telegram("🚀 Scanner (Railway) started – test message.")
+        send_telegram("🚀 Scanner (Railway, PRO Variant B) started – test message.")
     except Exception as e:
         print("startup telegram error:", e)
 
     # Railway-də main thread boş qalmamalıdır (container yoxsa ölür)
     while True:
         time.sleep(5)
-
