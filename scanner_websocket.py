@@ -58,18 +58,18 @@ mini_lock = threading.Lock()
 # ============================================================
 
 # --- PRO START CONFIG ---
-START_PCT = 5.0                 # 15m price change threshold
-START_VOLUME_SPIKE = 2.0        # vol_mult minimum
-START_MICRO_PCT = 0.03          # short_pct minimum (micro impulse)
+START_PCT = 2.0                 # 15m price change threshold
+START_VOLUME_SPIKE = 1.5        # vol_mult minimum
+START_MICRO_PCT = 0.02          # short_pct minimum (micro impulse)
 
-FAKE_VOLUME_STRENGTH = 1.2      # volume_strength >= 1.2
+FAKE_VOLUME_STRENGTH = 1.1      # volume_strength >= 1.2
 FAKE_RECENT_MIN_USDT = 2000     # recent_1m >= 2000
 FAKE_RECENT_STRONG_USDT = 10000 # vol_mult <= 50 OR recent_1m >= 10k
 
 # Momentum pattern threshold (Pattern Summary üçün)
 MOMENTUM_THRESHOLD = START_PCT   # START üçün momentum threshold qalır
 
-PATTERN_PCT = 3.0
+PATTERN_PCT = 2.0
 
 # Existing unchanged:
 MIN24H = 2_000_000
@@ -1961,3 +1961,4 @@ if __name__ == "__main__":
     # Railway-də main thread boş qalmamalıdır (container yoxsa ölür)
     while True:
         time.sleep(5)
+
