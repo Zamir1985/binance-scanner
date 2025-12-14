@@ -55,16 +55,16 @@ last_heartbeat_ts = 0.0
 # ============================================================
 
 # --- PRO START CONFIG ---
-START_PCT = 5.0                 # 15m price change threshold
-START_VOLUME_SPIKE = 3.0        # vol_mult minimum
-START_MICRO_PCT = 0.05          # short_pct minimum (micro impulse)
+START_PCT = 1.0                 # 15m price change threshold
+START_VOLUME_SPIKE = 1.1        # vol_mult minimum
+START_MICRO_PCT = 0.0          # short_pct minimum (micro impulse)
 
-FAKE_VOLUME_STRENGTH = 1.5      # volume_strength >= 1.2
-FAKE_RECENT_MIN_USDT = 2000     # recent_1m >= 2000
-FAKE_RECENT_STRONG_USDT = 10000 # vol_mult <= 50 OR recent_1m >= 10k
+FAKE_VOLUME_STRENGTH = 0.0      # volume_strength >= 1.2
+FAKE_RECENT_MIN_USDT = 0     # recent_1m >= 2000
+FAKE_RECENT_STRONG_USDT = 0 # vol_mult <= 50 OR recent_1m >= 10k
 
 # Existing unchanged:
-MIN24H = 2_000_000
+MIN24H = 300_000
 
 STEP_PCT = 5.0
 STEP_VOLUME_SPIKE = 2.0
@@ -1607,3 +1607,4 @@ if __name__ == "__main__":
 
     while True:
         time.sleep(5)
+
