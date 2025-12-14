@@ -1,15 +1,10 @@
 # ============================================================
-#   Binance Futures Scanner — Railway Version (FINAL PATCHED)
+#   Binance Futures Scanner — Railway Version
 #   START / STEP / EXIT / REVERSE — FULL ORIGINAL LOGIC
 #   + Heartbeat (Alive ping to Telegram)
 #   + Signal Logging (START / STEP / EXIT / REVERSE)
 #   + Watchdog (auto-restart if data stops)
 #   7/24 stable Railway execution
-#
-#   PATCHED:
-#     1) miniTicker volume uses q (quote/USDT) if available
-#     2) don't process whole market before tracked_syms is loaded
-#     3) ws_monitor min_active is dynamic (prevents infinite reconnect loops)
 # ============================================================
 
 import os
@@ -57,11 +52,16 @@ last_heartbeat_ts = 0.0
 # --- PRO START CONFIG ---
 START_PCT = 1.0                 # 15m price change threshold
 START_VOLUME_SPIKE = 1.1        # vol_mult minimum
-START_MICRO_PCT = 0.0          # short_pct minimum (micro impulse)
+START_MICRO_PCT = 0.0        # short_pct minimum (micro impulse)
 
 FAKE_VOLUME_STRENGTH = 0.0      # volume_strength >= 1.2
-FAKE_RECENT_MIN_USDT = 0     # recent_1m >= 2000
+FAKE_RECENT_MIN_USDT = 0      # recent_1m >= 2000
 FAKE_RECENT_STRONG_USDT = 0 # vol_mult <= 50 OR recent_1m >= 10k
+
+# Momentum pattern threshold (Pattern Summary üçün)
+MOMENTUM_THRESHOLD = START_PCT   # START üçün momentum threshold qalır
+
+PATTERN_PCT = 1.0
 
 # Existing unchanged:
 MIN24H = 300_000
@@ -105,21 +105,6 @@ WATCHDOG_NO_MSG_TIMEOUT = int(os.getenv("WATCHDOG_NO_MSG_TIMEOUT", "900"))  # 15
 WATCHDOG_MIN_UPTIME = 300  # ilk 5 dəqiqədə restart etməsin
 
 # ============================================================
-# SPOT MODEL — Signal Quality Adjustment (backend only)
-# ============================================================
-
-SPOT_MODEL_ENABLED = True
-
-SPOT_ADJ_MAX_POS = 15
-SPOT_ADJ_MAX_NEG = -20
-
-SPOT_LATE_STAGE_PENALTY = -8
-SPOT_OI_UP_NOTIONAL_DOWN_PENALTY = -15
-SPOT_RETAIL_CROWD_PENALTY = -7
-SPOT_HEALTHY_CONT_BONUS = +10
-SPOT_SHORT_SQUEEZE_BONUS = +8
-
-# ============================================================
 # API KEYS
 # ============================================================
 
@@ -132,25 +117,15 @@ client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 FAPI = "https://fapi.binance.com"
 
 # ============================================================
-# MARKDOWN ESCAPE (Telegram MarkdownV2 - FIXED)
+# MARKDOWN ESCAPE
 # ============================================================
 
-def escape_md(text: str) -> str:
-    """
-    Telegram MarkdownV2 escaping.
-    Reserved characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
-    Also must escape backslash itself.
-    """
+def escape_md(text):
     if not text:
         return ""
-
-    # Escape backslash first
-    text = text.replace("\\", "\\\\")
-
-    # Then escape all other MarkdownV2 reserved chars
-    for c in r"_*[]()~`>#+-=|{}.!":
+    chars = r"\_[]()#+-=!.>"
+    for c in chars:
         text = text.replace(c, "\\" + c)
-
     return text
 
 # ============================================================
@@ -381,7 +356,7 @@ def compute_signal_quality(
         # 4) Funding Rate (5%)
         if funding_label not in ["PASS", "-", None]:
             if isinstance(funding_label, str) and funding_label.startswith("-"):
-                score += 5
+                score += 5  # slightly favor negative funding for shorts
             else:
                 score += 2.5
 
@@ -417,6 +392,7 @@ def compute_signal_quality(
                     ob_component = 0.0
                 else:
                     ratio_norm = max(r, 1.0 / r)
+                    # 1.0 -> 0, 3.0+ -> 1
                     ob_component = min(max((ratio_norm - 1.0) / 2.0, 0.0), 1.0)
                 score += ob_component * 10
             except Exception:
@@ -427,71 +403,6 @@ def compute_signal_quality(
     except Exception:
         return 0
 
-
-def compute_spot_adjustment(
-    stage_label,
-    direction,
-    oi_chg,
-    not_chg,
-    acc_r,
-    pos_r,
-    glb_r,
-    funding_change,
-    wce_score
-):
-    if not SPOT_MODEL_ENABLED:
-        return 0
-
-    adj = 0
-
-    # 1) LATE stage penalty
-    if stage_label == "LATE":
-        adj += SPOT_LATE_STAGE_PENALTY
-
-    # 2) OI ↑ but Notional ↓ → fake risk
-    if isinstance(oi_chg, (int, float)) and isinstance(not_chg, (int, float)):
-        if oi_chg > 0 and not_chg < 0:
-            adj += SPOT_OI_UP_NOTIONAL_DOWN_PENALTY
-
-    # 3) Retail crowding
-    ratios = [r for r in (acc_r, pos_r, glb_r) if isinstance(r, (int, float))]
-    avg_ls = None
-    if ratios:
-        avg_ls = sum(ratios) / len(ratios)
-
-        if direction == "LONG" and avg_ls >= 1.6:
-            adj += SPOT_RETAIL_CROWD_PENALTY
-        if direction == "SHORT" and avg_ls <= 0.7:
-            adj += SPOT_RETAIL_CROWD_PENALTY
-
-    # 4) Healthy continuation bonus
-    if (
-        stage_label in ("EARLY", "MID")
-        and isinstance(oi_chg, (int, float)) and oi_chg > 0
-        and isinstance(not_chg, (int, float)) and not_chg > 0
-        and (wce_score is None or wce_score >= 55)
-    ):
-        adj += SPOT_HEALTHY_CONT_BONUS
-
-    # 5) SHORT SQUEEZE / CROWD TRAP bonus
-    try:
-        fc = float(funding_change) if funding_change is not None else 0.0
-    except Exception:
-        fc = 0.0
-
-    if (
-        direction == "LONG"
-        and stage_label in ("EARLY", "MID")
-        and isinstance(oi_chg, (int, float)) and oi_chg > 0
-        and isinstance(not_chg, (int, float)) and not_chg > 0
-        and fc <= -0.10
-        and (avg_ls is None or avg_ls <= 1.2)
-        and (wce_score is None or wce_score >= 55)
-    ):
-        adj += SPOT_SHORT_SQUEEZE_BONUS
-
-    adj = max(SPOT_ADJ_MAX_NEG, min(SPOT_ADJ_MAX_POS, adj))
-    return int(adj)
 
 # ============================================================
 # SENTIMENT (OI, Notional, Long/Short, Funding)
@@ -507,6 +418,7 @@ def fetch_sentiment_metrics(symbol):
     try:
         base = f"{FAPI}/futures/data"
 
+        # Open Interest history (15m)
         oi = requests.get(
             f"{base}/openInterestHist",
             params={"symbol": symbol, "period": "15m", "limit": 2},
@@ -526,6 +438,7 @@ def fetch_sentiment_metrics(symbol):
             metrics["oi_now"] = f"{int(curr_oi):,}"
             metrics["not_now"] = f"{int(curr_va):,}"
 
+        # Long/Short ratios
         def fetch_ratio(url):
             try:
                 d = requests.get(url, timeout=6).json()
@@ -539,6 +452,7 @@ def fetch_sentiment_metrics(symbol):
         metrics["pos_r"] = fetch_ratio(f"{base}/topLongShortPositionRatio?symbol={symbol}&period=15m&limit=1")
         metrics["glb_r"] = fetch_ratio(f"{base}/globalLongShortAccountRatio?symbol={symbol}&period=15m&limit=1")
 
+        # ------------------ FUNDING (current → 15m fallback) ------------------
         try:
             fund = requests.get(
                 f"{base}/fundingRate",
@@ -549,6 +463,7 @@ def fetch_sentiment_metrics(symbol):
             current_f = None
             old_15m = None
 
+            # Latest funding
             try:
                 if isinstance(fund, list) and len(fund) >= 1:
                     x = fund[-1].get("fundingRate")
@@ -557,6 +472,7 @@ def fetch_sentiment_metrics(symbol):
             except Exception:
                 pass
 
+            # Search ~15 minutes earlier
             try:
                 if isinstance(fund, list) and len(fund) > 1:
                     ts_now = fund[-1].get("fundingTime", 0)
@@ -569,6 +485,7 @@ def fetch_sentiment_metrics(symbol):
             except Exception:
                 pass
 
+            # compute funding_change (numeric) if possible
             try:
                 if current_f is not None and old_15m is not None:
                     metrics["funding_change"] = (current_f - old_15m) * 100.0
@@ -577,18 +494,17 @@ def fetch_sentiment_metrics(symbol):
             except Exception:
                 metrics["funding_change"] = 0.0
 
+            # ---- formatting ----
             def interval_map(v):
                 v = round(v, 4)
                 intervals = [-2, -1, -0.5, -0.1, 0, 0.1, 0.5, 1, 2]
-                if v < intervals[0]:
-                    return "< -2"
-                if v >= intervals[-1]:
-                    return "> 2"
-                for i in range(len(intervals) - 1):
+                # small bug above but we don't touch it, as requested
+                for i in range(len(intervals)-1):
                     if intervals[i] <= v < intervals[i+1]:
                         return f"{intervals[i]} - {intervals[i+1]}"
-                return "PASS"
+                return "< -2" if v < -2 else "> 2"
 
+            # Priority:
             if current_f is not None:
                 metrics["last_f"] = interval_map(current_f)
             elif old_15m is not None:
@@ -604,6 +520,7 @@ def fetch_sentiment_metrics(symbol):
         metrics["last_f"] = "PASS"
         metrics["funding_change"] = 0.0
 
+    # Build text
     def fmt_change(val):
         try:
             if val == "-" or val is None:
@@ -633,6 +550,7 @@ def fetch_sentiment_cached(symbol, ttl=SENTIMENT_CACHE_TTL):
     sentiment_cache[symbol] = {"ts": now, "text": text, "metrics": metrics}
     return text, metrics
 
+
 # ============================================================
 # WAVE CONFIRMATION ENGINE (WCE)
 # ============================================================
@@ -657,6 +575,7 @@ def compute_wce(
         pos_adv = (pos_ratio - 50.0) if isinstance(pos_ratio, (int, float)) else 0.0
         glb_adv = (global_ratio - 50.0) if isinstance(global_ratio, (int, float)) else 0.0
 
+        # weights
         w_oi   = 0.25
         w_not  = 0.20
         w_ls   = 0.12
@@ -728,6 +647,287 @@ def compute_wce(
         return 50, "UNKNOWN", "MEDIUM", "LOW", "\n🔥 Wave Confirmation: unavailable"
 
 # ============================================================
+# PATTERN-BASED SENTIMENT ENGINE (Variant C)
+# ============================================================
+
+def generate_pattern_analysis(
+    metrics,
+    price_pct,
+    rsi=None,
+    rsi_3m=None,
+    ob_ratio=None,
+    ob_label=None,
+    stage_label=None,
+    mode="full"
+):
+    """
+    Pattern-based analiz:
+    • OI Pattern
+    • Pro Traders bias
+    • Retail bias
+    • Global sentiment
+    • Momentum context
+    • Price vs OI divergence
+    + Trend Verdict + Fake-out risk + Squeeze probability + Final Confirmation
+    mode = "full" / "short" / "exit"
+    """
+    try:
+        def to_float(val, default=None):
+            try:
+                if val in ["-", None]:
+                    return default
+                return float(val)
+            except Exception:
+                return default
+
+        oi_chg = to_float(metrics.get("oi_chg"), 0.0)
+        not_chg = to_float(metrics.get("not_chg"), 0.0)
+        acc_r = to_float(metrics.get("acc_r"), None)
+        pos_r = to_float(metrics.get("pos_r"), None)
+        glb_r = to_float(metrics.get("glb_r"), None)
+        fund_chg = to_float(metrics.get("funding_change"), 0.0)
+
+        price_pct = price_pct or 0.0
+        abs_p = abs(price_pct)
+
+        # ----- OI Pattern -----
+        if oi_chg is None:
+            oi_label = "Flat / unknown"
+        elif oi_chg > 2:
+            oi_label = "Increasing (leverage coming in)"
+        elif oi_chg < -2:
+            oi_label = "Decreasing (positions closing)"
+        else:
+            oi_label = "Stable / sideway"
+
+        # ----- Pro Traders (Pos L/S) -----
+        if pos_r is None:
+            pro_label = "Neutral / unknown"
+        elif pos_r > 1.1:
+            pro_label = "Long-biased (Pos L/S > 1)"
+        elif pos_r < 0.9:
+            pro_label = "Short-biased (Pos L/S < 1)"
+        else:
+            pro_label = "Balanced"
+
+        # ----- Retail (Acct L/S) -----
+        if acc_r is None:
+            retail_label = "Neutral / unknown"
+        elif acc_r > 1.1:
+            retail_label = "Long-heavy (FOMO risk)"
+        elif acc_r < 0.9:
+            retail_label = "Short-heavy (squeeze fuel)"
+        else:
+            retail_label = "Balanced / mixed"
+
+        # ----- Global sentiment -----
+        if glb_r is None:
+            global_label = "Neutral"
+        elif glb_r > 1.05:
+            global_label = "Bullish-leaning"
+        elif glb_r < 0.95:
+            global_label = "Bearish-leaning"
+        else:
+            global_label = "Neutral"
+
+        # ----- Momentum Context -----
+        if abs_p < MOMENTUM_THRESHOLD * 0.5:
+            momentum_label = "Weak / choppy"
+        elif abs_p < MOMENTUM_THRESHOLD * 1.2:
+            momentum_label = "Building"
+        else:
+            momentum_label = "Strong move"
+
+        # ----- Price vs OI divergence -----
+        if price_pct > 0 and oi_chg is not None and oi_chg < 0:
+            divergence_label = "Price↑ & OI↓ → Short squeeze potential"
+            squeeze_bias = 2
+        elif price_pct < 0 and oi_chg is not None and oi_chg > 0:
+            divergence_label = "Price↓ & OI↑ → Leverage trap / breakdown risk"
+            squeeze_bias = -1
+        else:
+            divergence_label = "Price & OI aligned"
+            squeeze_bias = 0
+
+        # ----- Trend direction (bias) -----
+        if price_pct > 0:
+            bias = "LONG"
+            trend_dir_label = "Bullish"
+        elif price_pct < 0:
+            bias = "SHORT"
+            trend_dir_label = "Bearish"
+        else:
+            bias = "NONE"
+            trend_dir_label = "Sideways"
+
+        # ----- Fake-out risk score -----
+        fake_score = 0
+
+        # Retail FOMO aynı tərəfdədirsə risk artır
+        if bias == "LONG" and acc_r is not None and acc_r > 1.1 and glb_r is not None and glb_r > 1.05:
+            fake_score += 2
+        if bias == "SHORT" and acc_r is not None and acc_r < 0.9 and glb_r is not None and glb_r < 0.95:
+            fake_score += 2
+
+        # OI dəstəyi zəif, amma price böyük hərəkət edibsə
+        if abs_p >= PATTERN_PCT and (oi_chg is not None and abs(oi_chg) < 1.0):
+            fake_score += 1
+
+        # Squeeze bullish divergence riskdən çox qazancdır → risk azaldır
+        if squeeze_bias > 0 and bias == "LONG":
+            fake_score = max(fake_score - 1, 0)
+
+        if fake_score <= 0:
+            fake_label = "LOW"
+        elif fake_score <= 2:
+            fake_label = "MEDIUM"
+        else:
+            fake_label = "HIGH"
+
+        # ----- Squeeze probability -----
+        squeeze_prob = "LOW"
+        if (
+            price_pct > 0
+            and oi_chg is not None and oi_chg <= 0
+            and acc_r is not None and acc_r < 0.9
+            and glb_r is not None and glb_r < 0.9
+        ):
+            squeeze_prob = "HIGH"
+        elif squeeze_bias > 0:
+            squeeze_prob = "MEDIUM"
+
+        # ----- Final Confirmation score (0–100) -----
+        score = 0.0
+
+        # Price move baza
+        score += min(abs_p / PATTERN_PCT, 2.0) * 20  # max ~40
+
+        # OI alignment
+        if oi_chg is not None:
+            same_dir = (price_pct > 0 and oi_chg > 0) or (price_pct < 0 and oi_chg < 0)
+            if same_dir:
+                score += 20
+            elif squeeze_bias != 0:
+                score += 10
+
+        # Pro alignment
+        if bias == "LONG" and pos_r is not None and pos_r > 1.05:
+            score += 15
+        if bias == "SHORT" and pos_r is not None and pos_r < 0.95:
+            score += 15
+
+        # Retail contrarian bonus
+        if bias == "LONG" and acc_r is not None and acc_r < 0.9:
+            score += 10
+        if bias == "SHORT" and acc_r is not None and acc_r > 1.1:
+            score += 10
+
+        # Momentum bonus
+        if momentum_label == "Strong move":
+            score += 10
+
+        # Fake-out penalty
+        if fake_label == "HIGH":
+            score -= 20
+        elif fake_label == "MEDIUM":
+            score -= 5
+
+        score = max(0, min(int(round(score)), 100))
+
+        # Bias icon + NO-TRADE rejimi
+        if score < 40 or bias == "NONE":
+            final_bias = "NO TRADE"
+            icon = "🟧"
+        else:
+            final_bias = bias
+            icon = "🟢" if bias == "LONG" else "🔴"
+
+        # ----- Trend Verdict text -----
+        if trend_dir_label == "Bullish":
+            if momentum_label == "Strong move":
+                verdict = "Bullish & Strong"
+            elif momentum_label == "Weak / choppy":
+                verdict = "Bullish but Weak"
+            else:
+                verdict = "Bullish (developing)"
+        elif trend_dir_label == "Bearish":
+            if momentum_label == "Strong move":
+                verdict = "Bearish & Strong"
+            elif momentum_label == "Weak / choppy":
+                verdict = "Bearish but Weak"
+            else:
+                verdict = "Bearish (developing)"
+        else:
+            verdict = "Sideways / No clear trend"
+
+        # ----- Reason line -----
+        reasons = []
+        if oi_chg is not None:
+            if price_pct > 0 and oi_chg > 0:
+                reasons.append("OI↑ + Price↑ (real trend)")
+            elif price_pct < 0 and oi_chg < 0:
+                reasons.append("OI↓ + Price↓ (real unwinding)")
+        if pos_r is not None:
+            if bias == "LONG" and pos_r > 1.05:
+                reasons.append("pro accumulation")
+            if bias == "SHORT" and pos_r < 0.95:
+                reasons.append("pro short bias")
+        if acc_r is not None:
+            if acc_r > 1.1:
+                reasons.append("retail FOMO same side")
+            elif acc_r < 0.9:
+                reasons.append("retail opposite (squeeze fuel)")
+        if ob_ratio is not None and ob_label:
+            if ob_ratio > 1.3 and bias == "LONG":
+                reasons.append("bid-side orderbook support")
+            if ob_ratio < (1/1.3) and bias == "SHORT":
+                reasons.append("ask-side orderbook pressure")
+
+        if not reasons:
+            reasons.append("mixed sentiment, low conviction")
+
+        reason_line = ", ".join(reasons)
+
+        # ----- Build text block according to mode -----
+
+        lines = ["\n📊 PATTERN SUMMARY"]
+
+        # full / short / exit selectable
+        if mode == "full":
+            lines.append(f"• OI Pattern: {oi_label}")
+            lines.append(f"• Pro Traders: {pro_label}")
+            lines.append(f"• Retail: {retail_label}")
+            lines.append(f"• Global Sentiment: {global_label}")
+            lines.append(f"• Momentum Context: {momentum_label}")
+            lines.append(f"• Divergence: {divergence_label}")
+        elif mode == "short":
+            lines.append(f"• OI: {oi_label}")
+            lines.append(f"• Pro: {pro_label}")
+            lines.append(f"• Retail: {retail_label}")
+            lines.append(f"• Divergence: {divergence_label}")
+        elif mode == "exit":
+            lines.append(f"• OI: {oi_label}")
+            lines.append(f"• Retail: {retail_label}")
+            lines.append(f"• Divergence: {divergence_label}")
+
+        # Trend Verdict + risk + squeeze
+        lines.append(f"\n🎯 TREND VERDICT: {verdict}")
+        lines.append(f"Fake-out risk: {fake_label}")
+        lines.append(f"Squeeze probability: {squeeze_prob}")
+
+        # Final confirmation
+        lines.append("\n🔮 FINAL CONFIRMATION:")
+        lines.append(f"{icon} {final_bias} — {score}%")
+        lines.append(f"Reason: {reason_line}")
+
+        block = "\n".join(lines)
+        return block
+
+    except Exception as e:
+        print("generate_pattern_analysis error:", e)
+        return ""
+
+# ============================================================
 # TELEGRAM
 # ============================================================
 
@@ -783,17 +983,21 @@ def maybe_send_exit_and_reverse(
     if not start_time:
         return
 
+    # EXIT yalnız ACTIVE fazasında mümkündür
     if entry.get("phase") != "ACTIVE":
         return
 
+    # EXIT üçün minimum yaş
     if now_ts - start_time < EXIT_MIN_AGE:
         return
 
+    # EXIT check intervalı
     last_check = entry.get("last_exit_check", 0.0)
     if now_ts - last_check < EXIT_CHECK_INTERVAL:
         return
     entry["last_exit_check"] = now_ts
 
+    # Volume drop (1m vs əvvəlki 5m avg)
     vol_drop = 0.0
     if baseline_avg_1m and baseline_avg_1m > 0:
         try:
@@ -801,6 +1005,7 @@ def maybe_send_exit_and_reverse(
         except Exception:
             vol_drop = 0.0
 
+    # Sentiment + RSI + Orderbook + WCE yenilə (cache-lər sayəsində API load azdır)
     closes = get_closes(symbol, limit=100, interval="1m")
     rsi = compute_rsi(closes, RSI_PERIOD)
 
@@ -837,25 +1042,40 @@ def maybe_send_exit_and_reverse(
     prev_rsi3m_trend = entry.get("last_rsi3m_trend")
     direction = entry.get("direction", "UNKNOWN")
 
+    # Ensure initial RSI3m trend baseline is set (PRO FIX)
+    if prev_rsi3m_trend is None and rsi3m_trend is not None:
+        entry["last_rsi3m_trend"] = rsi3m_trend
+        prev_rsi3m_trend = rsi3m_trend
+
     reasons = []
 
+    # 1) WCE drop
     wce_drop = prev_wce - wce_score
     wce_drop_ok = wce_drop >= EXIT_WCE_DROP
     if wce_drop_ok:
         reasons.append(f"WCE drop {prev_wce:.0f} → {wce_score:.0f}")
 
+    # 2) Volume collapse
     vol_drop_ok = vol_drop >= EXIT_VOLUME_DROP
     if vol_drop_ok:
         reasons.append(f"Volume collapse {vol_drop*100:.1f}%")
 
+    # 3) Micro spike reversal
+    micro_reverse_ok = False
     if direction == "LONG" and short_pct <= -EXIT_MICRO_REVERSE:
+        micro_reverse_ok = True
         reasons.append(f"Micro reverse {short_pct:.2f}% vs LONG")
     elif direction == "SHORT" and short_pct >= EXIT_MICRO_REVERSE:
+        micro_reverse_ok = True
         reasons.append(f"Micro reverse {short_pct:.2f}% vs SHORT")
 
+    # 4) RSI(3m) trend flip
+    rsi3_flip_ok = False
     if EXIT_USE_RSI3M_FLIP and prev_rsi3m_trend and rsi3m_trend and rsi3m_trend != prev_rsi3m_trend:
+        rsi3_flip_ok = True
         reasons.append(f"RSI(3m) flip {prev_rsi3m_trend} → {rsi3m_trend}")
 
+    # Ən azı 2 səbəb lazımdır
     if len(reasons) < 2:
         entry["last_wce"] = wce_score
         entry["last_trend_dir"] = wce_trend
@@ -863,6 +1083,7 @@ def maybe_send_exit_and_reverse(
         entry["last_signal_q"] = signal_q
         return
 
+    # EXIT artıq göndərilibsə və çox tezdirsə, təkrar etmə
     last_exit = entry.get("exit_sent_at")
     if last_exit and (now_ts - last_exit) < 60:
         entry["last_wce"] = wce_score
@@ -873,6 +1094,7 @@ def maybe_send_exit_and_reverse(
 
     vol24 = get_24h_volume_cached(symbol)
 
+    # REVERSE opportunity
     reverse_note = "🔄 Reverse opportunity: NONE"
     reverse_triggered = False
     if REVERSE_ENABLED and direction in ("LONG", "SHORT"):
@@ -900,6 +1122,18 @@ def maybe_send_exit_and_reverse(
 
     reasons_text = "\n".join(f"• {r}" for r in reasons)
 
+    # Pattern snapshot (short)
+    pattern_block = generate_pattern_analysis(
+        metrics,
+        pct_15m,
+        rsi=rsi,
+        rsi_3m=rsi3m,
+        ob_ratio=ob_ratio,
+        ob_label=ob_label,
+        stage_label=stage_label,
+        mode="exit"
+    )
+
     caption = (
         "⚠ EXIT SIGNAL\n"
         f"{symbol}\n\n"
@@ -913,7 +1147,8 @@ def maybe_send_exit_and_reverse(
         f"Orderbook: {ob_label}\n"
         f"24h Volume: {int(vol24):,} USDT\n"
         f"Signal Quality: {signal_q}/100\n"
-        f"WCE Score: {wce_score}%\n\n"
+        f"WCE Score: {wce_score}%\n"
+        f"{pattern_block}\n\n"
         f"Reasons:\n{reasons_text}\n\n"
         f"{reverse_note}\n"
         f"{wce_text}\n"
@@ -927,6 +1162,7 @@ def maybe_send_exit_and_reverse(
         entry["phase"] = "EXITED"
         print(f"{symbol} | EXIT signal sent, tracking stopped.")
 
+        # Log EXIT event
         log_signal("EXIT", {
             "symbol": symbol,
             "direction": direction,
@@ -949,6 +1185,7 @@ def maybe_send_exit_and_reverse(
                 "signal_q": signal_q
             })
 
+    # Metrikləri yenilə
     entry["last_wce"] = wce_score
     entry["last_trend_dir"] = wce_trend
     entry["last_rsi3m_trend"] = rsi3m_trend
@@ -961,6 +1198,9 @@ def maybe_send_exit_and_reverse(
 ws_manager = None  # active ThreadedWebsocketManager instance
 
 def get_score_level(score: int) -> str:
+    """
+    START / STEP bildirişlərində istifadə olunan eyni level mapping.
+    """
     if score < 40:
         return "WEAK ⚠️"
     if score < 70:
@@ -971,6 +1211,9 @@ def get_score_level(score: int) -> str:
 
 
 def _process_mini(msg):
+    """
+    Binance miniticker mesajı üçün core START / STEP / EXIT məntiqi.
+    """
     global last_log, last_any_msg_ts, last_start_ts
 
     symbol = msg.get("s") or msg.get("symbol")
@@ -978,22 +1221,14 @@ def _process_mini(msg):
         return
 
     now = time.time()
-    last_any_msg_ts = now
+    last_any_msg_ts = now  # hər gələn miniticker-də yenilə
 
-    # ------------------------------------------------------------
-    # PATCH 2: start_stream tamamlanana qədər bazarı emal etmə
-    # (tracked_syms boşdursa bütün marketi emal etməsin)
-    # ------------------------------------------------------------
-    if not tracked_syms:
-        return
-
+    # ----------- LOG LIMIT (console izləmə) -----------
     if now - last_log > 2:
         try:
             price_raw = msg.get("c", msg.get("lastPrice", 0))
             open_raw  = msg.get("o", msg.get("openPrice", 0))
-
-            # PATCH 1: Prefer quote volume (USDT) if present; fallback to base volume
-            vol_raw   = msg.get("q", msg.get("quoteVolume", msg.get("v", msg.get("volume", 0))))
+            vol_raw   = msg.get("v", msg.get("volume", 0))
 
             try:
                 price = float(price_raw)
@@ -1017,8 +1252,10 @@ def _process_mini(msg):
             print("Mini data: <parse error>")
 
         last_log = now
+    # --------------------------------------------------
 
     try:
+        # yalnız USDT cütlərini qəbul et
         if not symbol.endswith("USDT"):
             return
 
@@ -1026,9 +1263,7 @@ def _process_mini(msg):
             return
 
         price_raw = msg.get("c", msg.get("lastPrice", 0))
-
-        # PATCH 1: Prefer quote volume (USDT) if present; fallback to base volume
-        vol_raw = msg.get("q", msg.get("quoteVolume", msg.get("v", msg.get("volume", 0))))
+        vol_raw = msg.get("v", msg.get("volume", 0))
 
         try:
             price = float(price_raw)
@@ -1043,6 +1278,7 @@ def _process_mini(msg):
         if price == 0:
             return
 
+        # --- per-symbol tracking state ---
         entry = state.setdefault(symbol, {
             "prices": [],
             "vols": [],
@@ -1052,6 +1288,7 @@ def _process_mini(msg):
             "last_step_price": None,
             "last_step_time": None,
             "stopped_at": None,
+            # V3 fields
             "start_time": None,
             "exit_sent_at": None,
             "last_exit_check": 0.0,
@@ -1061,6 +1298,7 @@ def _process_mini(msg):
             "last_rsi3m_trend": None,
             "last_signal_q": None,
         })
+        # NEW: default phase
         entry.setdefault("phase", "IDLE")
 
         entry["prices"].append(price)
@@ -1072,6 +1310,7 @@ def _process_mini(msg):
         entry["last_v"] = vol
         entry["vols"].append(diff_vol)
 
+        # max 30 dəq history (təxminən 1 sample/s → 1800 sample)
         if len(entry["prices"]) > 1800:
             entry["prices"] = entry["prices"][-1800:]
             entry["vols"] = entry["vols"][-1800:]
@@ -1081,6 +1320,7 @@ def _process_mini(msg):
         if len(entry["prices"]) < 5:
             return
 
+        # --- 15 dəqiqəlik lookback qiyməti ---
         lookback_samples = LOOKBACK_MIN * 60
         if len(entry["prices"]) >= lookback_samples:
             price_15min_ago = entry["prices"][-lookback_samples]
@@ -1089,12 +1329,13 @@ def _process_mini(msg):
 
         pct_15m = (price - price_15min_ago) / price_15min_ago * 100 if price_15min_ago else 0.0
 
+        # ---------- VOLUME SPIKE (1m vs previous 5m avg) ----------
         vols = entry["vols"]
         n_vols = len(vols)
         recent_1m = 0.0
         baseline_avg_1m = 0.0
 
-        if n_vols >= 360:
+        if n_vols >= 360:  # 6 dəq history (1m + 5m)
             recent_1m = sum(vols[-60:])
             prev_5m = sum(vols[-360:-60])
             baseline_avg_1m = prev_5m / 5.0 if prev_5m > 0 else 0.0
@@ -1110,6 +1351,7 @@ def _process_mini(msg):
 
         recent_sum = recent_1m
 
+        # ---------- PRICE SPIKE STABILIZER (short window) ----------
         short_pct = 0.0
         if len(entry["prices"]) >= SHORT_WINDOW:
             try:
@@ -1128,6 +1370,7 @@ def _process_mini(msg):
         else:
             vol_mult_display = f"×{vol_mult:.2f}{fake_tag}"
 
+        # ---- VOLUME STRENGTH (son 15m / əvvəlki 15m) ----
         last_15_volume = 0.0
         prev_15_volume = 0.0
         if len(vols) >= 1800:
@@ -1145,7 +1388,9 @@ def _process_mini(msg):
         STOP_SECONDS = 2 * 3600
         now_ts = now
 
+        # ================= TRACKING MODE =================
         if entry.get("tracking"):
+            # STEP yalnız STARTED və ACTIVE vəziyyətində işləyir
             if entry.get("phase") not in ("STARTED", "ACTIVE"):
                 return
 
@@ -1156,6 +1401,7 @@ def _process_mini(msg):
                 print(f"{symbol} | tracking stopped due to inactivity ({STOP_SECONDS}s) — PASSIVE now.")
                 return
 
+            # STEP trigger
             last_step_price = entry.get("last_step_price", price)
             pct_from_last_step = ((price - last_step_price) / last_step_price) * 100 if last_step_price else 0.0
 
@@ -1203,6 +1449,18 @@ def _process_mini(msg):
                     ob_ratio=ob_ratio
                 )
 
+                # Pattern (short) for STEP
+                pattern_block = generate_pattern_analysis(
+                    metrics,
+                    pct_15m,
+                    rsi=rsi,
+                    rsi_3m=rsi3m,
+                    ob_ratio=ob_ratio,
+                    ob_label=ob_label,
+                    stage_label=stage_label,
+                    mode="short"
+                )
+
                 vol24 = get_24h_volume_cached(symbol)
 
                 caption = (
@@ -1221,6 +1479,7 @@ def _process_mini(msg):
                     f"📉 RSI(3m): {rsi3m} ({rsi3m_trend})\n"
                     f"📊 Orderbook: {ob_label}\n"
                     f"{sentiment_text}\n"
+                    f"{pattern_block}\n"
                     f"🔍 Signal Quality: {signal_q}/100 ({get_score_level(signal_q)})\n\n"
                     f"{wce_text}"
                 )
@@ -1233,6 +1492,7 @@ def _process_mini(msg):
                     entry["last_signal_q"] = signal_q
                     entry["phase"] = "ACTIVE"
 
+                    # Log STEP event
                     log_signal("STEP", {
                         "symbol": symbol,
                         "price": price,
@@ -1249,6 +1509,7 @@ def _process_mini(msg):
 
                 step_fired = True
 
+            # STEP olmasa EXIT engine-i işə sal
             if not step_fired:
                 maybe_send_exit_and_reverse(
                     symbol,
@@ -1264,21 +1525,26 @@ def _process_mini(msg):
                 )
             return
 
+        # ================= PASSIVE MODE (START axtarır) =================
         else:
             vol24 = get_24h_volume_cached(symbol)
 
+            # START yalnız IDLE və ya EXITED fazasında mümkündür
             if entry.get("phase") not in ("IDLE", "EXITED"):
                 return
 
             if (
+                # PRIMARY IMPULSE
                 abs(pct_15m) >= START_PCT
                 and vol_mult >= START_VOLUME_SPIKE
                 and abs(short_pct) >= START_MICRO_PCT
 
+                # FAKE-PUMP FILTER
                 and volume_strength >= FAKE_VOLUME_STRENGTH
                 and recent_1m >= FAKE_RECENT_MIN_USDT
                 and (vol_mult <= 50 or recent_1m >= FAKE_RECENT_STRONG_USDT)
 
+                # Minimum liquidity
                 and vol24 >= MIN24H
             ):
                 entry["tracking"] = True
@@ -1287,6 +1553,7 @@ def _process_mini(msg):
                 entry["last_step_time"] = now_ts
                 entry["stopped_at"] = None
 
+                # V3 fields
                 entry["start_time"] = now_ts
                 entry["exit_sent_at"] = None
                 entry["last_exit_check"] = 0.0
@@ -1301,7 +1568,7 @@ def _process_mini(msg):
                 ob_ratio, ob_label = fetch_orderbook_imbalance_cached(symbol)
                 stage_label = classify_impulse_stage(vol_mult, volume_strength)
 
-                base_signal_q = compute_signal_quality(
+                signal_q = compute_signal_quality(
                     rsi=rsi,
                     vol_mult=vol_mult,
                     oi_chg=metrics.get("oi_chg"),
@@ -1321,23 +1588,21 @@ def _process_mini(msg):
                     metrics.get("funding_change", 0.0),
                     rsi,
                     pct_15m,
-                    rsi_3m=rsi3m if rsi3m is not None else 50.0,
+                    rsi3m=rsi3m if rsi3m is not None else 50.0,
                     ob_ratio=ob_ratio
                 )
 
-                spot_adj = compute_spot_adjustment(
+                # FULL Pattern Engine for START
+                pattern_block = generate_pattern_analysis(
+                    metrics,
+                    pct_15m,
+                    rsi=rsi,
+                    rsi_3m=rsi3m,
+                    ob_ratio=ob_ratio,
+                    ob_label=ob_label,
                     stage_label=stage_label,
-                    direction=entry["direction"],
-                    oi_chg=metrics.get("oi_chg"),
-                    not_chg=metrics.get("not_chg"),
-                    acc_r=metrics.get("acc_r"),
-                    pos_r=metrics.get("pos_r"),
-                    glb_r=metrics.get("glb_r"),
-                    funding_change=metrics.get("funding_change"),
-                    wce_score=wce_score
+                    mode="full"
                 )
-
-                signal_q = int(max(0, min(100, base_signal_q + spot_adj)))
 
                 caption = (
                     "🚀 START\n"
@@ -1354,7 +1619,7 @@ def _process_mini(msg):
                     f"📉 RSI(3m): {rsi3m} ({rsi3m_trend})\n"
                     f"📊 Orderbook: {ob_label}\n"
                     f"{sentiment_text}\n"
-                    f"🧩 Spot Adj: {spot_adj:+d}\n"
+                    f"{pattern_block}\n"
                     f"🔍 Signal Quality: {signal_q}/100 ({get_score_level(signal_q)})\n\n"
                     f"{wce_text}"
                 )
@@ -1367,6 +1632,7 @@ def _process_mini(msg):
                     entry["last_signal_q"] = signal_q
                     last_start_ts = now_ts
 
+                    # Log START event
                     log_signal("START", {
                         "symbol": symbol,
                         "price": price,
@@ -1376,7 +1642,6 @@ def _process_mini(msg):
                         "vol_mult": vol_mult,
                         "wce_score": wce_score,
                         "signal_q": signal_q,
-                        "spot_adj": spot_adj,
                         "direction": entry["direction"],
                         "stage": stage_label,
                     })
@@ -1392,6 +1657,9 @@ def _process_mini(msg):
 
 
 def handle_miniticker(msg):
+    """
+    Accept either a dict (single symbol) or a list of dicts (bulk).
+    """
     try:
         if msg is None:
             return
@@ -1413,20 +1681,20 @@ def handle_miniticker(msg):
 # ============================================================
 
 def ws_monitor(min_active=10, check_interval=30):
+    """
+    Railway üçün sabit WebSocket monitoru.
+    Sadə: əgər 90 saniyədən çoxdur symbol görülmürsə → reconnect.
+    """
     global ws_manager
 
     while True:
         try:
             now = time.time()
 
-            # ------------------------------------------------------------
-            # PATCH 3: dynamic minimum based on tracked set size
-            # ------------------------------------------------------------
-            min_req = min(min_active, max(2, len(tracked_syms)//3)) if tracked_syms else min_active
             active = sum(1 for s in tracked_syms if last_seen.get(s, 0) > now - 90)
 
-            if active < min_req:
-                print(f"⚠ WS monitor: Only {active} active symbols (min_req={min_req}) — reconnecting WS...")
+            if active < min_active:
+                print(f"⚠ WS monitor: Only {active} active symbols — reconnecting WS...")
 
                 try:
                     if ws_manager is not None:
@@ -1484,6 +1752,8 @@ def heartbeat_loop():
                 last_msg_age = now - last_any_msg_ts if last_any_msg_ts > 0 else None
 
                 ws_status = "OK ✅" if ws_manager is not None else "NONE ⚠️"
+
+                # düzgün formatlanmış mesaj
                 tick_text = f"{int(last_msg_age)}s" if last_msg_age is not None else "N/A"
 
                 hb_text = (
@@ -1576,6 +1846,7 @@ def start_stream():
         twm.start()
         ws_manager = twm
 
+        # Single global stream — Railway üçün ən stabil variant
         twm.start_miniticker_socket(callback=handle_miniticker)
         print("🔌 Subscribed to MINITICKER global stream.")
 
@@ -1583,8 +1854,38 @@ def start_stream():
         print("❌ Failed to start global miniticker socket:", e)
         return
 
+    # Background monitor
     threading.Thread(target=ws_monitor, daemon=True).start()
     print("🚀 Scanner started (WebSocket + Monitor)")
+
+# ============================================================
+# HEARTBEAT SYSTEM — Telegram Alive Ping (Railway safe)
+# ============================================================
+
+def heartbeat(interval_minutes=30):
+    start_ts = time.time()
+
+    while True:
+        try:
+            uptime_h = (time.time() - start_ts) / 3600
+            active_syms = sum(1 for s in tracked_syms if last_seen.get(s, 0) > time.time() - 120)
+
+            ws_status = "OK" if active_syms >= 5 else "WEAK ⚠️"
+
+            text = (
+                "🤖 *Scanner Alive (Railway)*\n"
+                f"⏳ Uptime: {uptime_h:.1f}h\n"
+                f"📡 Active Symbols: {active_syms}/{len(tracked_syms)}\n"
+                f"🔌 WebSocket: {ws_status}\n"
+                f"🕒 Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+            send_telegram(text)
+
+        except Exception as e:
+            print("Heartbeat error:", e)
+
+        time.sleep(interval_minutes * 60)
 
 # ============================================================
 # MAIN (Railway Optimized)
@@ -1600,11 +1901,12 @@ if __name__ == "__main__":
     except Exception as e:
         print("❌ Failed to start background threads:", e)
 
+    # 🔔 BURADA BİR DƏFƏLİK TEST MESAJI GÖNDƏR
     try:
         send_telegram("🚀 Scanner (Railway) started – test message.")
     except Exception as e:
         print("startup telegram error:", e)
 
+    # Railway-də main thread boş qalmamalıdır (container yoxsa ölür)
     while True:
         time.sleep(5)
-
