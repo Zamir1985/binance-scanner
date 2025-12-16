@@ -305,3 +305,30 @@ def compute_wce(
 
     except Exception:
         return 50, "UNKNOWN", "MEDIUM", "LOW", "\n🔥 Wave Confirmation: unavailable"
+
+# ============================================================
+# 24H VOLUME (CACHED)
+# ============================================================
+
+_vol24_cache = {}
+
+def get_24h_volume_cached(symbol: str) -> float:
+    now = time.time()
+    c = _vol24_cache.get(symbol)
+    if c and now - c["ts"] < 300:
+        return c["vol"]
+
+    try:
+        r = requests.get(
+            f"{FAPI_BASE}/fapi/v1/ticker/24hr",
+            params={"symbol": symbol},
+            timeout=6
+        ).json()
+
+        vol = float(r.get("quoteVolume", 0.0))
+    except Exception:
+        vol = 0.0
+
+    _vol24_cache[symbol] = {"ts": now, "vol": vol}
+    return vol
+
