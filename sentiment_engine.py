@@ -106,3 +106,39 @@ def fetch_sentiment_cached(symbol: str) -> dict:
 
     _SENTIMENT_CACHE[symbol] = {"ts": now, "metrics": metrics}
     return metrics
+
+# ============================================================
+# SENTIMENT TEXT FORMATTER
+# ============================================================
+
+def format_sentiment_text(metrics: dict) -> str:
+    """
+    Formats sentiment metrics into human-readable text block
+    """
+    if not metrics:
+        return ""
+
+    lines = ["\n🧠 SENTIMENT"]
+
+    if metrics.get("oi_chg") is not None:
+        lines.append(f"OI change: {metrics['oi_chg']:+.2f}%")
+
+    if metrics.get("not_chg") is not None:
+        lines.append(f"Notional change: {metrics['not_chg']:+.2f}%")
+
+    if metrics.get("acc_r") is not None:
+        lines.append(f"Retail L/S: {metrics['acc_r']:.2f}")
+
+    if metrics.get("pos_r") is not None:
+        lines.append(f"Pro L/S: {metrics['pos_r']:.2f}")
+
+    if metrics.get("glb_r") is not None:
+        lines.append(f"Global L/S: {metrics['glb_r']:.2f}")
+
+    if metrics.get("last_f") not in [None, "PASS"]:
+        lines.append(f"Funding: {metrics['last_f']}")
+
+    if metrics.get("funding_change"):
+        lines.append(f"Funding Δ: {metrics['funding_change']:+.2f}%")
+
+    return "\n".join(lines)
