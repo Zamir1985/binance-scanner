@@ -1409,14 +1409,20 @@ def handle_miniticker(msg):
         print("handle_miniticker error:", e)
 
 # ============================================================
-# WEBSOCKET MONITOR
+# WEBSOCKET MONITOR (FUTURES MULTIPLEX — python-binance 1.0.19)
 # ============================================================
 
 def _start_miniticker_socket(twm: ThreadedWebsocketManager):
-    # Futures method exists in some versions; fallback otherwise
-    if hasattr(twm, "start_futures_miniticker_socket"):
-        return twm.start_futures_miniticker_socket(callback=handle_miniticker)
-    return twm.start_futures_miniticker_socket(callback=handle_miniticker)
+    # Futures GLOBAL miniticker (supported in python-binance 1.0.19)
+    streams = ["!miniTicker@arr"]
+
+    twm.start_futures_multiplex_socket(
+        streams=streams,
+        callback=handle_miniticker
+    )
+
+    print("📡 Subscribed to FUTURES MINITICKER multiplex stream.")
+
 
 def ws_monitor(min_active=10, check_interval=30):
     global ws_manager
