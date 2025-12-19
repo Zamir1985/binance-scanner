@@ -1416,7 +1416,7 @@ def _start_miniticker_socket(twm: ThreadedWebsocketManager):
     # Futures method exists in some versions; fallback otherwise
     if hasattr(twm, "start_futures_miniticker_socket"):
         return twm.start_futures_miniticker_socket(callback=handle_miniticker)
-    return twm.start_miniticker_socket(callback=handle_miniticker)
+    return twm.start_futures_miniticker_socket(callback=handle_miniticker)
 
 def ws_monitor(min_active=10, check_interval=30):
     global ws_manager
