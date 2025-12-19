@@ -1,21 +1,20 @@
 FROM python:3.11-slim
 
-# Work directory
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
 WORKDIR /app
 
-# Install system deps (optional but useful for some libs)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+# ---- Python tooling ----
+RUN pip install --upgrade pip setuptools wheel
 
-# Copy requirement file
+# ---- Dependencies ----
 COPY requirements.txt .
+RUN pip install -r requirements.txt
 
-# Install python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy scanner code
+# ---- App ----
 COPY scanner_websocket.py .
 
-# Default command
-CMD ["python3", "scanner_websocket.py"]
+# ---- Run ----
+CMD ["python", "scanner_websocket.py"]
