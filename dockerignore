@@ -6,3 +6,5 @@ __pycache__/
 .env
 .vscode
 .idea
+.pytest_cache/
+.DS_Store
