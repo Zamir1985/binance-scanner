@@ -1589,8 +1589,7 @@ def start_stream():
         ws_manager = twm
 
         _start_miniticker_socket(twm)
-        print("🔌 Subscribed to MINITICKER global stream.")
-
+        
     except Exception as e:
         print("❌ Failed to start miniticker socket:", e)
         return
