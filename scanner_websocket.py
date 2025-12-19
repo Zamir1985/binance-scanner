@@ -27,10 +27,8 @@ print = functools.partial(print, flush=True)
 # GLOBAL STATES
 # ============================================================
 
-last_log = 0
 state = {}             # per-symbol signal tracking
 last_seen = {}         # symbol timestamp monitor
-notified = {}
 tracked_syms = set()
 
 # API caches
@@ -88,7 +86,6 @@ LOOKBACK_MIN = 15
 RSI_PERIOD = 14
 TOP_N = 50
 SHORT_WINDOW = 5
-MIN_RECENT_VOLUME_USDT = 1500
 
 RSI3M_CACHE_TTL = 20
 ORDERBOOK_CACHE_TTL = 10
@@ -1070,7 +1067,7 @@ def maybe_send_exit_and_reverse(
     closes = get_closes(symbol, limit=100, interval="1m")
     rsi = compute_rsi(closes, RSI_PERIOD)
 
-    sentiment_text, metrics = fetch_sentiment_cached(symbol)
+    _, metrics = fetch_sentiment_cached(symbol)
     rsi3m, rsi3m_trend = fetch_rsi_3m_cached(symbol)
     ob_ratio, ob_label = fetch_orderbook_imbalance_cached(symbol)
 
@@ -1156,7 +1153,7 @@ def maybe_send_exit_and_reverse(
 # ============================================================
 
 def _process_mini(msg):
-    global last_log, last_any_msg_ts, last_start_ts
+    global last_any_msg_ts
 
     symbol = msg.get("s") or msg.get("symbol")
     if not symbol or not symbol.endswith("USDT"):
@@ -1169,7 +1166,6 @@ def _process_mini(msg):
         return
 
     price = float(msg.get("c", 0) or 0)
-    open_ = float(msg.get("o", price) or price)
     vol = float(msg.get("q", msg.get("v", 0)) or 0)
 
     if price <= 0:
@@ -1197,10 +1193,17 @@ def _process_mini(msg):
 
     last_seen[symbol] = now
 
-    if len(entry["prices"]) < LOOKBACK_MIN * 10:
+    prices = entry["prices"]
+    plen = len(prices)
+
+    # --- HARD SAFETY GUARDS ---
+    if plen <= LOOKBACK_MIN * 60:
         return
 
-    price_15m_ago = entry["prices"][-LOOKBACK_MIN * 60]
+    if plen <= SHORT_WINDOW:
+        return
+
+    price_15m_ago = prices[-LOOKBACK_MIN * 60]
     pct_15m = (price - price_15m_ago) / price_15m_ago * 100 if price_15m_ago else 0.0
 
     recent_1m = sum(entry["vols"][-60:])
@@ -1213,7 +1216,7 @@ def _process_mini(msg):
         max(sum(entry["vols"][-1800:-900]), 1)
     )
 
-    short_base = entry["prices"][-SHORT_WINDOW]
+    short_base = prices[-SHORT_WINDOW]
     short_pct = (price - short_base) / short_base * 100 if short_base else 0.0
 
     now_ts = now
@@ -1580,7 +1583,7 @@ if __name__ == "__main__":
     threading.Thread(target=watchdog_loop, daemon=True).start()
 
     try:
-        send_telegram("🚀 Scanner started (Balanced Final)")
+        send_telegram("🚀 Scanner started")
     except:
         pass
 
