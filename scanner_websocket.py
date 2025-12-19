@@ -40,7 +40,6 @@ vol24_cache = {}
 # Uptime / monitor states
 START_TIME = time.time()
 last_any_msg_ts = 0.0
-last_start_ts = 0.0
 last_heartbeat_ts = 0.0
 
 # Websocket manager holder
@@ -1360,7 +1359,6 @@ def _process_mini(msg):
         if send_telegram(caption):
             entry["last_wce"] = wce_score
             entry["last_signal_q"] = signal_q
-            last_start_ts = now_ts
 
             log_signal("START", {
                 "symbol": symbol,
