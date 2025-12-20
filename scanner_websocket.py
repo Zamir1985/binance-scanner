@@ -61,7 +61,7 @@ rest_pool = ThreadPoolExecutor(max_workers=REST_POOL_SIZE)
 
 START_PCT = 5.0
 START_VOLUME_SPIKE = 3.0
-START_MICRO_PCT = 0.05
+START_MICRO_PCT = 0.07
 
 FAKE_VOLUME_STRENGTH = 1.5
 FAKE_RECENT_MIN_USDT = 2000
@@ -87,6 +87,8 @@ EXIT_MICRO_REVERSE = 0.15
 REVERSE_ENABLED = True
 REVERSE_WCE_MIN = 60.0
 REVERSE_SIGNALQ_MIN = 60.0
+
+REENTRY_COOLDOWN = 180  # seconds (3 dəqiqə)
 
 LOOKBACK_MIN = 15
 RSI_PERIOD = 14
@@ -1090,6 +1092,7 @@ def run_start_full(snapshot):
         if e:
             e["last_wce"] = wce_score
             e["last_signal_q"] = signal_q
+            e["last_rsi3m_trend"] = rsi3m_trend
     except:
         pass
 
@@ -1201,6 +1204,10 @@ def run_exit_full(snapshot):
         entry["tracking"] = False
         entry["exit_sent_at"] = now_ts
 
+        # 🔒 CLOSE CYCLE
+        entry["last_notify"] = None
+        entry["cooldown_until"] = now_ts + REENTRY_COOLDOWN
+
         log_signal("EXIT", {
             "symbol": symbol,
             "direction": direction,
@@ -1261,7 +1268,8 @@ def _process_mini(msg):
         "vols": [],
         "last_v": None,
         "tracking": False,
-        "phase": "IDLE"
+        "phase": "IDLE",
+        "last_notify": None    
     })
 
     entry["prices"].append(price)
@@ -1305,11 +1313,11 @@ def _process_mini(msg):
     now_ts = now
 
     # ========================================================
-    # STEP — FAST
+    # STEP — TELEMETRY (NO SIGNAL)
     # ========================================================
     if entry.get("phase") == "ACTIVE":
         last_step_price = entry.get("last_step_price", price)
-        pct_from_last = (price - last_step_price) / last_step_price * 100 if last_step_price else 0
+        pct_from_last = (price - last_step_price) / last_step_price * 100 if last_step_price else 0.0
 
         if (
             abs(pct_from_last) >= STEP_PCT
@@ -1318,26 +1326,57 @@ def _process_mini(msg):
         ):
             entry["last_step_price"] = price
 
+            prev = entry.get("last_notify")
+
+            # --- Δ vs previous notification (MAIN telemetry) ---
+            if prev:
+                dp_pct = (price - prev["price"]) / prev["price"] * 100 if prev.get("price") else 0.0
+                d_vol = vol_mult - prev.get("vol_mult", vol_mult)
+                d_str = volume_strength - prev.get("volume_strength", volume_strength)
+            else:
+                dp_pct = 0.0
+                d_vol = 0.0
+                d_str = 0.0
+
+            # --- Context vs START (optional, informational only) ---
+            start_price = entry.get("start_price")
+            from_start = (
+                (price - start_price) / start_price * 100
+                if start_price else 0.0
+            )
+
             caption = (
-                "⚡ STEP\n"
+                "📡 STEP — Telemetry\n"
                 f"{symbol}\n\n"
-                f"Δ Price: {pct_from_last:+.2f}%\n"
-                f"15m Change: {pct_15m:+.2f}%\n"
-                f"Vol spike: ×{vol_mult:.2f}\n"
-                f"Vol strength: {volume_strength:.2f}x"
+                "Δ vs Previous\n"
+                f"• Price: {dp_pct:+.2f}%\n"
+                f"• Vol spike: {d_vol:+.2f}\n"
+                f"• Vol strength: {d_str:+.2f}\n\n"
+                "Context\n"
+                f"• 15m total: {pct_15m:+.2f}%\n"
+                f"• From START: {from_start:+.2f}%"
             )
 
             send_telegram(caption)
 
+            # --- Update telemetry reference ---
+            entry["last_notify"] = {
+                "price": price,
+                "pct_15m": pct_15m,
+                "vol_mult": vol_mult,
+                "volume_strength": volume_strength,
+                "ts": now_ts
+            }
+
             log_signal("STEP", {
                 "symbol": symbol,
                 "pct_15m": pct_15m,
-                "pct_from_last": pct_from_last,
-                "vol_mult": vol_mult,
-                "volume_strength": volume_strength
+                "delta_price_pct": dp_pct,
+                "delta_vol_mult": d_vol,
+                "delta_volume_strength": d_str
             })
 
-        # EXIT — enqueue only
+        # EXIT — enqueue only (UNCHANGED)
         if EXIT_ENABLED:
             start_time = entry.get("start_time")
             if start_time and (now_ts - start_time >= EXIT_MIN_AGE):
@@ -1361,6 +1400,14 @@ def _process_mini(msg):
         return
 
     # ========================================================
+    # RE-ENTRY COOLDOWN GATE (ADDIM 5)
+    # ========================================================
+    if entry.get("phase") == "EXITED":
+        cd_until = entry.get("cooldown_until", 0)
+        if now_ts < cd_until:
+            return
+
+    # ========================================================
     # START — FULL POWER (ENQUEUE ONLY)
     # ========================================================
     if (
@@ -1371,12 +1418,24 @@ def _process_mini(msg):
         and recent_1m >= FAKE_RECENT_MIN_USDT
         and get_24h_volume_cached(symbol) >= MIN24H
     ):
+
+        prev_prices = entry.get("prices", [])
+        prev_vols = entry.get("vols", [])
+        prev_last_v = entry.get("last_v")
+
+        entry.clear()
+
+        entry["prices"] = prev_prices[-1800:]
+        entry["vols"] = prev_vols[-1800:]
+        entry["last_v"] = prev_last_v
+
         entry["phase"] = "ACTIVE"
         entry["tracking"] = True
         entry["start_price"] = price
         entry["last_step_price"] = price
         entry["start_time"] = now_ts
         entry["direction"] = "LONG" if pct_15m > 0 else "SHORT"
+        entry["last_notify"] = None
 
         snapshot = {
             "symbol": symbol,
@@ -1391,6 +1450,15 @@ def _process_mini(msg):
 
         try:
             task_queue.put_nowait(("START_FULL", snapshot))
+
+            entry["last_notify"] = {
+                "price": price,
+                "pct_15m": pct_15m,
+                "vol_mult": vol_mult,
+                "volume_strength": volume_strength,
+                "ts": now_ts
+            }
+
         except Full:
             print("⚠️ task_queue full, START dropped:", symbol)
 
