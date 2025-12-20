@@ -1000,8 +1000,10 @@ def run_start_full(snapshot):
     rsi = compute_rsi(closes, RSI_PERIOD)
 
     sentiment_text, metrics = fetch_sentiment_cached(symbol)
-    rsi3m, _ = fetch_rsi_3m_cached(symbol)
+    rsi3m, rsi3m_trend = fetch_rsi_3m_cached(symbol)
     ob_ratio, ob_label = fetch_orderbook_imbalance_cached(symbol)
+
+    vol24 = get_24h_volume_cached(symbol)      
 
     base_q = compute_signal_quality(
         rsi,
@@ -1378,6 +1380,7 @@ def _process_mini(msg):
 
         snapshot = {
             "symbol": symbol,
+            "price": price,
             "pct_15m": pct_15m,
             "vol_mult": vol_mult,
             "volume_strength": volume_strength,
