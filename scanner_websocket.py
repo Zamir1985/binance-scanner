@@ -1153,6 +1153,7 @@ def run_start_full(snapshot):
         if e:
             e["last_wce"] = wce_score
             e["last_signal_q"] = signal_q
+            e["last_rsi3m_trend"] = rsi3m_trend
     except:
         pass
 
@@ -1463,18 +1464,15 @@ def _process_mini(msg):
         abs(pct_15m) >= START_PCT
         and vol_mult >= START_VOLUME_SPIKE
         and abs(short_pct) >= START_MICRO_PCT
+
+        # --- FAKE SPIKE PROTECTION (RESTORED) ---
         and volume_strength >= FAKE_VOLUME_STRENGTH
         and recent_1m >= FAKE_RECENT_MIN_USDT
+        and (vol_mult <= 50 or recent_1m >= FAKE_RECENT_STRONG_USDT)
+
+        # --- LIQUIDITY FILTER ---
         and get_24h_volume_cache_only(symbol) >= MIN24H
     ):
-        rsi_gate = (
-            rsi_momentum_component(
-                compute_rsi(entry["prices"][-100:], RSI_PERIOD)
-            ) >= 0.4
-        )
-
-        if not rsi_gate:
-            return  # START yoxdur
 
         entry["phase"] = "ACTIVE"
         entry["tracking"] = True
