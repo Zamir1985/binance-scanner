@@ -61,7 +61,7 @@ rest_pool = ThreadPoolExecutor(max_workers=REST_POOL_SIZE)
 
 START_PCT = 3.0
 START_VOLUME_SPIKE = 2.0
-START_MICRO_PCT = 0.03
+START_MICRO_PCT = 0.02
 
 FAKE_VOLUME_STRENGTH = 1.2
 FAKE_RECENT_MIN_USDT = 200
@@ -1574,8 +1574,12 @@ def handle_miniticker(msg):
 # ============================================================
 
 def _start_miniticker_socket(twm: ThreadedWebsocketManager):
-    twm.start_futures_miniticker_socket(callback=handle_miniticker)
-    print("📡 Subscribed to FUTURES MINITICKER (SINGLE STREAM).")
+    streams = ["!miniTicker@arr"]
+    twm.start_futures_multiplex_socket(
+        streams=streams,
+        callback=handle_miniticker
+    )
+    print("📡 Subscribed to FUTURES MINITICKER multiplex stream.")
 
 def ws_monitor(min_active=10, check_interval=30):
     global ws_manager
