@@ -60,17 +60,17 @@ rest_pool = ThreadPoolExecutor(max_workers=REST_POOL_SIZE)
 # ============================================================
 
 START_PCT = 2.0
-START_VOLUME_SPIKE = 1.5
-START_MICRO_PCT = 0.02
+START_VOLUME_SPIKE = 1.2
+START_MICRO_PCT = 0.01
 
 FAKE_VOLUME_STRENGTH = 1.1
-FAKE_RECENT_MIN_USDT = 200
-FAKE_RECENT_STRONG_USDT = 1000
+FAKE_RECENT_MIN_USDT = 20
+FAKE_RECENT_STRONG_USDT = 100
 
 MOMENTUM_THRESHOLD = START_PCT
 PATTERN_PCT = 3.0
 
-MIN24H = 100_000
+MIN24H = 10_000
 
 STEP_PCT = 5.0
 STEP_VOLUME_SPIKE = 2.0
@@ -1747,4 +1747,5 @@ if __name__ == "__main__":
 
     while True:
         time.sleep(5)
+
 
