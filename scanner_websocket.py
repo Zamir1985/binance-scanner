@@ -40,6 +40,10 @@ START_TIME = time.time()
 last_any_msg_ts = 0.0
 last_heartbeat_ts = 0.0
 
+# WS health (YOL A - minimal)
+ws_state = "INIT"          # INIT | LIVE | RECONNECTING
+last_reconnect_ts = 0.0
+
 # Websocket manager holder
 ws_manager = None
 
@@ -1532,49 +1536,75 @@ def handle_miniticker(msg):
 
 def _start_miniticker_socket(twm: ThreadedWebsocketManager):
     streams = ["!miniTicker@arr"]
-    twm.start_futures_multiplex_socket(
-        streams=streams,
-        callback=handle_miniticker
-    )
-    print("📡 Subscribed to FUTURES MINITICKER multiplex stream.")
+    try:
+        twm.start_futures_multiplex_socket(
+            streams=streams,
+            callback=handle_miniticker
+        )
+        print("📡 Subscribed to FUTURES MINITICKER multiplex stream.")
+        return True
+    except Exception as e:
+        print("❌ start_miniticker_socket error:", e)
+        return False
 
-def ws_monitor(min_active=10, check_interval=30):
-    global ws_manager
+def ws_monitor(check_interval=15):
+    global ws_manager, ws_state, last_reconnect_ts
 
     while True:
         try:
             now = time.time()
 
-            min_req = min(min_active, max(2, len(tracked_syms)//3)) if tracked_syms else min_active
-            active = sum(1 for s in tracked_syms if last_seen.get(s, 0) > now - 90)
+            # Hələ WS-dən heç mesaj gəlməyibsə — gözlə
+            if last_any_msg_ts == 0:
+                time.sleep(check_interval)
+                continue
 
-            if active < min_req:
-                print(f"⚠ WS monitor: {active}/{min_req} active — reconnecting WS")
+            age = now - last_any_msg_ts
 
-                try:
-                    if ws_manager:
-                        ws_manager.stop()
-                        time.sleep(2)
-                except:
-                    pass
+            # WS normal axırsa
+            if age <= 120:
+                if ws_state != "LIVE":
+                    ws_state = "LIVE"
+                    print(f"✅ WS LIVE (last tick age: {int(age)}s)")
+                time.sleep(check_interval)
+                continue
 
-                try:
-                    twm = ThreadedWebsocketManager(
-                        api_key=BINANCE_API_KEY,
-                        api_secret=BINANCE_API_SECRET
-                    )
-                    twm.start()
+            # Cooldown — tez-tez reconnect etmə
+            if now - last_reconnect_ts < 60:
+                if ws_state != "RECONNECTING":
+                    ws_state = "RECONNECTING"
+                print(f"⚠ WS stale ({int(age)}s) but cooldown active")
+                time.sleep(check_interval)
+                continue
+
+            # Reconnect
+            ws_state = "RECONNECTING"
+            last_reconnect_ts = now
+            print(f"⚠ WS stale ({int(age)}s). Reconnecting...")
+
+            try:
+                old = ws_manager  # köhnə socket reference (STOP YOX)
+
+                twm = ThreadedWebsocketManager(
+                    api_key=BINANCE_API_KEY,
+                    api_secret=BINANCE_API_SECRET
+                )
+                twm.start()
+
+                ok = _start_miniticker_socket(twm)
+                if ok:
                     ws_manager = twm
-                    _start_miniticker_socket(twm)
-                    print("🔁 WebSocket reconnected")
-                except Exception as e:
-                    print("WS reconnect failed:", e)
+                    ws_state = "LIVE"
+                    print("🔁 WebSocket reconnected (old socket abandoned).")
+                    time.sleep(check_interval)
+                else:
+                    try:
+                        twm.stop()
+                    except:
+                        pass
 
-            time.sleep(check_interval)
-
-        except Exception as e:
-            print("ws_monitor error:", e)
-            time.sleep(check_interval)
+            except Exception as e:
+                print("WS reconnect failed:", e)
 
 # ============================================================
 # HEARTBEAT
@@ -1609,7 +1639,7 @@ def heartbeat_loop():
                 total = len(tracked_syms)
                 last_msg_age = now - last_any_msg_ts if last_any_msg_ts > 0 else None
 
-                ws_status = "OK ✅" if ws_manager is not None else "NONE ⚠️"
+                ws_status = ws_state if ws_manager is not None else "NONE ⚠️"
                 tick_text = f"{int(last_msg_age)}s" if last_msg_age is not None else "N/A"
 
                 hb_text = (
@@ -1635,6 +1665,8 @@ def heartbeat_loop():
 # ============================================================
 
 def watchdog_loop():
+    global last_reconnect_ts
+
     if not WATCHDOG_ENABLED:
         return
 
@@ -1649,16 +1681,13 @@ def watchdog_loop():
             uptime = now - START_TIME
 
             if idle > WATCHDOG_NO_MSG_TIMEOUT and uptime > WATCHDOG_MIN_UPTIME:
-                msg = (
-                    f"⚠ Watchdog: no miniticker for {int(idle)}s, "
-                    f"uptime {format_uptime(uptime)} — restarting scanner (Railway will respawn)."
-                )
-                print(msg)
-                try:
-                    send_telegram(msg)
-                except:
-                    pass
-                os._exit(1)
+                if ws_state != "RECONNECTING":
+                    print("⚠ Watchdog: forcing reconnect instead of exit")
+                    last_reconnect_ts = 0  # force ws_monitor to act
+                else:
+                    print("⚠ Watchdog: already reconnecting, waiting")
+                time.sleep(60)
+                continue
 
         except Exception as e:
             print("watchdog_loop error:", e)
