@@ -61,7 +61,7 @@ rest_pool = ThreadPoolExecutor(max_workers=REST_POOL_SIZE)
 
 START_PCT = 3.0
 START_VOLUME_SPIKE = 2.0
-START_MICRO_PCT = 0.02
+START_MICRO_PCT = 0.03
 
 FAKE_VOLUME_STRENGTH = 1.2
 FAKE_RECENT_MIN_USDT = 200
@@ -1498,6 +1498,8 @@ def _process_mini(msg):
                 f"reasons={drop_reasons}"
             )
 # -------------------------
+
+
     if (
         abs(pct_15m) >= START_PCT
         and vol_mult >= START_VOLUME_SPIKE
@@ -1568,20 +1570,12 @@ def handle_miniticker(msg):
         print("handle_miniticker error:", e)
 
 # ============================================================
-# WEBSOCKET MONITOR (FUTURES MULTIPLEX — python-binance 1.0.19)
+# WEBSOCKET MONITOR (FUTURES MINITICKER — SINGLE STREAM)
 # ============================================================
 
 def _start_miniticker_socket(twm: ThreadedWebsocketManager):
-    # Futures GLOBAL miniticker (supported in python-binance 1.0.19)
-    streams = ["!miniTicker@arr"]
-
-    twm.start_futures_multiplex_socket(
-        streams=streams,
-        callback=handle_miniticker
-    )
-
-    print("📡 Subscribed to FUTURES MINITICKER multiplex stream.")
-
+    twm.start_futures_miniticker_socket(callback=handle_miniticker)
+    print("📡 Subscribed to FUTURES MINITICKER (SINGLE STREAM).")
 
 def ws_monitor(min_active=10, check_interval=30):
     global ws_manager
