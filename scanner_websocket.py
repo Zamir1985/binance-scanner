@@ -59,11 +59,11 @@ rest_pool = ThreadPoolExecutor(max_workers=REST_POOL_SIZE)
 # CONFIG
 # ============================================================
 
-START_PCT = 5.0
-START_VOLUME_SPIKE = 3.0
-START_MICRO_PCT = 0.05
+START_PCT = 3.0
+START_VOLUME_SPIKE = 2.0
+START_MICRO_PCT = 0.02
 
-FAKE_VOLUME_STRENGTH = 1.5
+FAKE_VOLUME_STRENGTH = 1.2
 FAKE_RECENT_MIN_USDT = 200
 FAKE_RECENT_STRONG_USDT = 1000
 
@@ -1305,6 +1305,16 @@ def analysis_worker():
 def _process_mini(msg):
     global last_any_msg_ts
 
+    # ---- WS TICK DEBUG ----
+    if not hasattr(_process_mini, "_tick_count"):
+        _process_mini._tick_count = 0
+
+    _process_mini._tick_count += 1
+
+    if _process_mini._tick_count <= 5 or _process_mini._tick_count % 500 == 0:
+        print(f"[WS TICK] #{_process_mini._tick_count} symbol={msg.get('s')}")
+    # -----------------------
+
     symbol = msg.get("s") or msg.get("symbol")
     if not symbol or not symbol.endswith("USDT"):
         return
@@ -1460,6 +1470,34 @@ def _process_mini(msg):
     # ========================================================
     # START — FULL POWER (ENQUEUE ONLY)
     # ========================================================
+
+    # ---- START DROP DEBUG ----
+    if abs(pct_15m) >= START_PCT:
+        drop_reasons = {}
+
+        if vol_mult < START_VOLUME_SPIKE:
+            drop_reasons["vol_mult"] = f"{vol_mult:.2f} < {START_VOLUME_SPIKE}"
+
+        if abs(short_pct) < START_MICRO_PCT:
+            drop_reasons["micro"] = f"{short_pct:.3f} < {START_MICRO_PCT}"
+
+        if volume_strength < FAKE_VOLUME_STRENGTH:
+            drop_reasons["vol_strength"] = f"{volume_strength:.2f} < {FAKE_VOLUME_STRENGTH}"
+
+        if recent_1m < FAKE_RECENT_MIN_USDT:
+            drop_reasons["recent_1m"] = f"{recent_1m:.0f} < {FAKE_RECENT_MIN_USDT}"
+
+        vol24 = get_24h_volume_cache_only(symbol)
+        if vol24 < MIN24H:
+            drop_reasons["vol24"] = f"{vol24:.0f} < {MIN24H}"
+
+        if drop_reasons:
+            print(
+                f"[START DROP] {symbol} "
+                f"15m={pct_15m:+.2f}% "
+                f"reasons={drop_reasons}"
+            )
+# -------------------------
     if (
         abs(pct_15m) >= START_PCT
         and vol_mult >= START_VOLUME_SPIKE
@@ -1754,4 +1792,3 @@ if __name__ == "__main__":
 
     while True:
         time.sleep(5)
-
