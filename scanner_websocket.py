@@ -59,18 +59,18 @@ rest_pool = ThreadPoolExecutor(max_workers=REST_POOL_SIZE)
 # CONFIG
 # ============================================================
 
-START_PCT = 3.0
-START_VOLUME_SPIKE = 2.0
-START_MICRO_PCT = 0.02
+START_PCT = 5.0
+START_VOLUME_SPIKE = 3.0
+START_MICRO_PCT = 0.05
 
-FAKE_VOLUME_STRENGTH = 1.2
-FAKE_RECENT_MIN_USDT = 200
-FAKE_RECENT_STRONG_USDT = 1000
+FAKE_VOLUME_STRENGTH = 1.5
+FAKE_RECENT_MIN_USDT = 2000
+FAKE_RECENT_STRONG_USDT = 10000
 
 MOMENTUM_THRESHOLD = START_PCT
 PATTERN_PCT = 3.0
 
-MIN24H = 2_000_000
+MIN24H = 1_000_000
 
 STEP_PCT = 5.0
 STEP_VOLUME_SPIKE = 2.0
@@ -1305,16 +1305,6 @@ def analysis_worker():
 def _process_mini(msg):
     global last_any_msg_ts
 
-    # ---- WS TICK DEBUG ----
-    if not hasattr(_process_mini, "_tick_count"):
-        _process_mini._tick_count = 0
-
-    _process_mini._tick_count += 1
-
-    if _process_mini._tick_count <= 5 or _process_mini._tick_count % 500 == 0:
-        print(f"[WS TICK] #{_process_mini._tick_count} symbol={msg.get('s')}")
-    # -----------------------
-
     symbol = msg.get("s") or msg.get("symbol")
     if not symbol or not symbol.endswith("USDT"):
         return
@@ -1470,36 +1460,6 @@ def _process_mini(msg):
     # ========================================================
     # START — FULL POWER (ENQUEUE ONLY)
     # ========================================================
-
-    # ---- START DROP DEBUG ----
-    if abs(pct_15m) >= START_PCT:
-        drop_reasons = {}
-
-        if vol_mult < START_VOLUME_SPIKE:
-            drop_reasons["vol_mult"] = f"{vol_mult:.2f} < {START_VOLUME_SPIKE}"
-
-        if abs(short_pct) < START_MICRO_PCT:
-            drop_reasons["micro"] = f"{short_pct:.3f} < {START_MICRO_PCT}"
-
-        if volume_strength < FAKE_VOLUME_STRENGTH:
-            drop_reasons["vol_strength"] = f"{volume_strength:.2f} < {FAKE_VOLUME_STRENGTH}"
-
-        if recent_1m < FAKE_RECENT_MIN_USDT:
-            drop_reasons["recent_1m"] = f"{recent_1m:.0f} < {FAKE_RECENT_MIN_USDT}"
-
-        vol24 = get_24h_volume_cache_only(symbol)
-        if vol24 < MIN24H:
-            drop_reasons["vol24"] = f"{vol24:.0f} < {MIN24H}"
-
-        if drop_reasons:
-            print(
-                f"[START DROP] {symbol} "
-                f"15m={pct_15m:+.2f}% "
-                f"reasons={drop_reasons}"
-            )
-# -------------------------
-
-
     if (
         abs(pct_15m) >= START_PCT
         and vol_mult >= START_VOLUME_SPIKE
@@ -1509,9 +1469,6 @@ def _process_mini(msg):
         and volume_strength >= FAKE_VOLUME_STRENGTH
         and recent_1m >= FAKE_RECENT_MIN_USDT
         and (vol_mult <= 50 or recent_1m >= FAKE_RECENT_STRONG_USDT)
-
-        # --- LIQUIDITY FILTER ---
-        and get_24h_volume_cache_only(symbol) >= MIN24H
     ):
 
         entry["phase"] = "ACTIVE"
@@ -1570,7 +1527,7 @@ def handle_miniticker(msg):
         print("handle_miniticker error:", e)
 
 # ============================================================
-# WEBSOCKET MONITOR (FUTURES MINITICKER — SINGLE STREAM)
+# WEBSOCKET MONITOR (FUTURES MULTIPLEX — python-binance 1.0.19)
 # ============================================================
 
 def _start_miniticker_socket(twm: ThreadedWebsocketManager):
@@ -1770,7 +1727,7 @@ def start_stream():
 # ============================================================
 
 if __name__ == "__main__":
-    print("🚀 SCANNER STARTING (BALANCED PRO)")
+    print("🚀 SCANNER STARTING (SCANNER PRO)")
 
     # Start workers FIRST
     for _ in range(max(1, TELEGRAM_WORKERS)):
