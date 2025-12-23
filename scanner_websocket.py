@@ -70,7 +70,7 @@ FAKE_RECENT_STRONG_USDT = 10000
 MOMENTUM_THRESHOLD = START_PCT
 PATTERN_PCT = 3.0
 
-MIN24H = 1_000_000
+MIN24H = 2_000_000
 
 STEP_PCT = 5.0
 STEP_VOLUME_SPIKE = 2.0
@@ -1747,3 +1747,4 @@ if __name__ == "__main__":
 
     while True:
         time.sleep(5)
+
