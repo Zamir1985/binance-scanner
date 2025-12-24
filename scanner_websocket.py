@@ -62,10 +62,10 @@ rest_pool = ThreadPoolExecutor(max_workers=REST_POOL_SIZE)
 # CONFIG
 # ============================================================
 
-START_PCT = 7.0
+START_PCT = 5.0
 START_VOLUME_SPIKE = 3.0
 START_MIN_VOLUME_STRENGTH = 1.5
-START_MICRO_PCT = 0.07
+START_MICRO_PCT = 0.05
 
 FAKE_VOLUME_STRENGTH = 1.5
 FAKE_RECENT_MIN_USDT = 2000
@@ -1942,3 +1942,4 @@ if __name__ == "__main__":
 
     while True:
         time.sleep(5)
+
