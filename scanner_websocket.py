@@ -64,7 +64,6 @@ rest_pool = ThreadPoolExecutor(max_workers=REST_POOL_SIZE)
 
 START_PCT = 5.0
 START_VOLUME_SPIKE = 3.0
-START_MIN_VOLUME_STRENGTH = 1.5
 START_MICRO_PCT = 0.05
 
 FAKE_VOLUME_STRENGTH = 1.5
@@ -697,9 +696,9 @@ def compute_wce(
         not_score = max(min(notional_change, 100.0), -100.0) if notional_change is not None else 0.0
         fund_score = max(min(funding_change, 100.0), -100.0) if funding_change is not None else 0.0
 
-        ls_adv = (acc_ratio - 1.0) if isinstance(acc_ratio, (int, float)) else 0.0
-        pos_adv = (pos_ratio - 1.0) if isinstance(pos_ratio, (int, float)) else 0.0
-        glb_adv = (global_ratio - 1.0) if isinstance(global_ratio, (int, float)) else 0.0
+        ls_adv = (acc_ratio - 50.0) if isinstance(acc_ratio, (int, float)) else 0.0
+        pos_adv = (pos_ratio - 50.0) if isinstance(pos_ratio, (int, float)) else 0.0
+        glb_adv = (global_ratio - 50.0) if isinstance(global_ratio, (int, float)) else 0.0
 
         w_oi   = 0.25
         w_not  = 0.20
@@ -760,27 +759,10 @@ def compute_wce(
         raw = max(min(raw, 1.0), -1.0)
         score = int(round((raw + 1) / 2 * 100))
 
-        # --- trend interpretation (ratio-aware, corrected scale) ---
         if price_pct > 0:
-            if (
-                (isinstance(acc_ratio, (int, float)) and acc_ratio > 1.05) or
-                (isinstance(pos_ratio, (int, float)) and pos_ratio > 1.05)
-            ):
-                trend = "LONG"
-            elif score >= 50:
-                trend = "LONG (weak)"
-            else:
-                trend = "LONG (uncertain)"
+            trend = "LONG" if acc_ratio > 55 or pos_ratio > 55 else "LONG (weak)" if score >= 50 else "LONG (uncertain)"
         else:
-            if (
-                (isinstance(acc_ratio, (int, float)) and acc_ratio < 0.95) or
-                (isinstance(pos_ratio, (int, float)) and pos_ratio < 0.95)
-            ):
-                trend = "SHORT"
-            elif score >= 50:
-                trend = "SHORT (weak)"
-            else:
-                trend = "SHORT (uncertain)"
+            trend = "SHORT" if acc_ratio < 45 or pos_ratio < 45 else "SHORT (weak)" if score >= 50 else "SHORT (uncertain)"
 
         fake = "HIGH" if oi_change < -3 and notional_change < -3 and abs(price_pct) >= 5 else \
                "MEDIUM" if oi_change < 0 and notional_change < 0 and abs(price_pct) >= 3 else \
@@ -1438,7 +1420,7 @@ def _process_mini(msg):
         return
 
     price = float(msg.get("c", 0) or 0)
-    vol = float(msg.get("q", 0) or 0)
+    vol = float(msg.get("q", msg.get("v", 0)) or 0)
 
     if price <= 0:
         return
@@ -1596,10 +1578,6 @@ def _process_mini(msg):
         abs(pct_15m) >= START_PCT
         and vol_mult >= START_VOLUME_SPIKE
         and abs(short_pct) >= START_MICRO_PCT
-
-        # --- START PRE-FILTER (PRO GATE) ---
-        and volume_strength >= START_MIN_VOLUME_STRENGTH
-        and classify_impulse_stage(vol_mult, volume_strength) != "LATE"
 
         # --- FAKE SPIKE PROTECTION (RESTORED) ---
         and volume_strength >= FAKE_VOLUME_STRENGTH
