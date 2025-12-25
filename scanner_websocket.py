@@ -1642,6 +1642,8 @@ def _process_mini(msg):
                     except Full:
                         print("⚠️ task_queue full, EXIT dropped:", symbol)
 
+        return
+
     # ========================================================
     # RE-ENTRY COOLDOWN GATE (ADDIM 5)
     # ========================================================
