@@ -21,9 +21,6 @@ print = functools.partial(print, flush=True)
 from queue import Queue, Full, Empty
 from concurrent.futures import ThreadPoolExecutor
 
-from collections import defaultdict
-state_locks = defaultdict(threading.Lock)
-
 # ============================================================
 # GLOBAL STATES
 # ============================================================
@@ -78,7 +75,6 @@ MIN24H = 1_000_000
 STEP_PCT = 5.0
 STEP_VOLUME_SPIKE = 2.0
 STEP_VOLUME_STRENGTH = 1.2
-STEP_MIN_INTERVAL = 120  # seconds
 
 EXIT_ENABLED = True
 EXIT_WCE_DROP = 25.0
@@ -91,9 +87,6 @@ EXIT_MICRO_REVERSE = 0.15
 REVERSE_ENABLED = True
 REVERSE_WCE_MIN = 60.0
 REVERSE_SIGNALQ_MIN = 60.0
-
-REENTRY_COOLDOWN = 180  # seconds (3 dəqiqə)
-REVERSE_COOLDOWN = 60  # seconds (micro cooldown for reverse)
 
 LOOKBACK_MIN = 15
 RSI_PERIOD = 14
@@ -202,7 +195,8 @@ def get_24h_volume_cached(symbol):
 
 def get_24h_volume_cache_only(symbol):
     """
-    WS thread üçün təhlükəsiz variant: Heç vaxt REST çağırmaz.
+    WS thread üçün təhlükəsiz variant.
+    Heç vaxt REST çağırmaz.
     Cache yoxdursa və ya köhnədirsə 0 qaytarır.
     """
     e = vol24_cache.get(symbol)
@@ -251,7 +245,8 @@ def compute_rsi(prices, period=14):
 
 def rsi_momentum_component(rsi):
     """
-    Momentum-aligned RSI scoring (trend-follow).
+    Momentum-aligned RSI scoring.
+    Trend strategiyası üçün optimallaşdırılıb.
     """
     if rsi is None:
         return 0.0
@@ -266,10 +261,10 @@ def rsi_momentum_component(rsi):
         return 0.2          # weak
     return 0.0              # extreme / bad
 
-
 def rsi_3m_trend_component(rsi3):
     """
-    Higher timeframe RSI trend confirmation (continuation alignment).
+    Higher timeframe RSI trend confirmation.
+    Continuation / trend alignment üçün.
     """
     if rsi3 is None:
         return 0.0
@@ -407,7 +402,8 @@ def compute_signal_quality(
         score = 0.0
 
         if rsi is not None:
-            score += rsi_momentum_component(rsi) * 15
+            rsi_component = rsi_momentum_component(rsi)
+            score += rsi_component * 15
 
         if vol_mult is not None:
             try:
@@ -570,13 +566,10 @@ def fetch_sentiment_metrics(symbol):
             try:
                 d = _http.get(url, timeout=6).json()
                 if isinstance(d, list) and len(d) >= 1:
-                    v = d[-1].get("longShortRatio")
-                    if v is None:
-                        return None
-                    return float(v)
+                    return float(d[-1].get("longShortRatio", 50.0))
             except Exception:
                 pass
-            return None
+            return "-"
 
         metrics["acc_r"] = fetch_ratio(f"{base}/topLongShortAccountRatio?symbol={symbol}&period=15m&limit=1")
         metrics["pos_r"] = fetch_ratio(f"{base}/topLongShortPositionRatio?symbol={symbol}&period=15m&limit=1")
@@ -716,27 +709,17 @@ def compute_wce(
         c_ls   = (ls_adv / 50.0) * dir_factor
         c_pos  = (pos_adv / 50.0) * dir_factor
 
-        if fund_score > 0:      # positive funding => long crowded
-            c_fund = -(fund_score / 100.0)
-        elif fund_score < 0:    # negative funding => short crowded
-            c_fund = +(abs(fund_score) / 100.0)
+        c_fund = (fund_score / 100.0) * (-1.0 if fund_score > 0 else 1.0)
+
+        if rsi is None:
+            c_rsi1 = 0.0
         else:
-            c_fund = 0.0
-        c_fund *= dir_factor
+            c_rsi1 = (1.0 - abs(rsi - 50.0)/50.0)*2 - 1
 
-        def rsi_trend_component_wce(rsi):
-            if rsi is None:
-                return 0.0
-            if 55 <= rsi <= 75:
-                return 1.0
-            if 75 < rsi <= 85:
-                return 0.6
-            if 45 <= rsi < 55:
-                return 0.2
-            return 0.0
-
-        c_rsi1 = rsi_trend_component_wce(rsi) * dir_factor
-        c_rsi3 = rsi_trend_component_wce(rsi_3m) * dir_factor
+        if rsi_3m is None:
+            c_rsi3 = 0.0
+        else:
+            c_rsi3 = (1.0 - abs(rsi_3m - 50.0)/50.0)*2 - 1
 
         if ob_ratio is None or ob_ratio <= 0:
             c_ob = 0.0
@@ -909,13 +892,6 @@ def generate_pattern_analysis(
         score = 0.0
         score += min(abs_p / PATTERN_PCT, 2.0) * 20
 
-        if rsi is not None:
-            if bias == "LONG" and rsi < 50:
-                score -= 10
-            if bias == "SHORT" and rsi > 50:
-                score -= 10
-
-
         if oi_chg is not None:
             same_dir = (price_pct > 0 and oi_chg > 0) or (price_pct < 0 and oi_chg < 0)
             if same_dir:
@@ -1080,16 +1056,6 @@ def run_start_full(snapshot):
     volume_strength = snapshot["volume_strength"]
     short_pct = snapshot["short_pct"]
     stage_label = snapshot["stage_label"]
-    is_reverse = snapshot.get("is_reverse", False)
-    forced_dir = snapshot.get("forced_direction")
-
-    direction = forced_dir if forced_dir else ("LONG" if pct_15m > 0 else "SHORT")
-
-    lock = state_locks[symbol]
-    with lock:
-        e = state.get(symbol)
-        if e:
-            e["direction"] = direction
 
     closes = get_closes(symbol, limit=100, interval="1m")
     rsi = compute_rsi(closes, RSI_PERIOD)
@@ -1124,6 +1090,8 @@ def run_start_full(snapshot):
         ob_ratio
     )
 
+    direction = "LONG" if pct_15m > 0 else "SHORT"
+
     spot_adj = compute_spot_adjustment(
         stage_label,
         direction,
@@ -1149,12 +1117,8 @@ def run_start_full(snapshot):
         mode="full"
     )
 
-    title = "🚀 START"
-    if is_reverse:
-        title = "🚀 START 🔄 REVERSE"
-
     caption = (
-        f"{title}\n"
+        "🚀 START\n"
         f"{symbol}\n\n"
         f"📈 Change (15m): {pct_15m:+.2f}%\n"
         f"💰 Price: {snapshot.get('price','-')}\n"
@@ -1167,8 +1131,9 @@ def run_start_full(snapshot):
         f"📉 RSI(3m): {rsi3m} ({rsi3m_trend})\n"
         f"📊 Orderbook: {ob_label}\n"
         f"{sentiment_text}\n"
-        f"🔍 Signal Quality: {signal_q}/100 "
-        f"🧮 (Base {base_q}/100, Spot {spot_adj:+d})\n\n"
+        f"🔍 Signal Quality: {signal_q}/100\n"
+        f"• Base: {base_q}\n"
+        f"• Spot Adj: {spot_adj:+d}\n\n"
         f"{pattern_block}\n\n"
         f"{wce_text}"
     )
@@ -1183,18 +1148,14 @@ def run_start_full(snapshot):
         "direction": direction
     })
 
-    lock = state_locks[symbol]
-    with lock:
+    try:
         e = state.get(symbol)
         if e:
-            e["phase"] = "ACTIVE"
-            e["tracking"] = True
-            e["start_time"] = snapshot.get("now_ts", time.time())
-            e["start_price"] = snapshot.get("price", e.get("last_price"))
-
             e["last_wce"] = wce_score
             e["last_signal_q"] = signal_q
             e["last_rsi3m_trend"] = rsi3m_trend
+    except:
+        pass
 
 # ============================================================
 # EXIT FULL (heavy) — moved off WS thread
@@ -1210,22 +1171,21 @@ def run_exit_full(snapshot):
     baseline_avg_1m = snapshot["baseline_avg_1m"]
     now_ts = snapshot["now_ts"]
 
-    lock = state_locks[symbol]
-    with lock:
-        entry = state.get(symbol)
-        if not entry:
-            return
+    entry = state.get(symbol)
+    if not entry:
+        return
 
-        start_time = entry.get("start_time")
-        if not start_time or entry.get("phase") != "ACTIVE":
-            return
-        if now_ts - start_time < EXIT_MIN_AGE:
-            return
+    # Re-check guards (same meaning, just safe)
+    start_time = entry.get("start_time")
+    if not start_time or entry.get("phase") != "ACTIVE":
+        return
+    if now_ts - start_time < EXIT_MIN_AGE:
+        return
 
-        last_check = entry.get("last_exit_check", 0.0)
-        if now_ts - last_check < EXIT_CHECK_INTERVAL:
-            return
-        entry["last_exit_check"] = now_ts
+    last_check = entry.get("last_exit_check", 0.0)
+    if now_ts - last_check < EXIT_CHECK_INTERVAL:
+        return
+    entry["last_exit_check"] = now_ts
 
     vol_drop = 0.0
     if baseline_avg_1m and baseline_avg_1m > 0:
@@ -1271,21 +1231,6 @@ def run_exit_full(snapshot):
 
     reasons = []
 
-    reverse_trigger = False
-
-    price_dir_now = "LONG" if pct_15m > 0 else "SHORT"
-    price_dir_prev = direction  # entry-dən gəlir
-
-    if REVERSE_ENABLED:
-        if (
-            prev_rsi3m_trend
-            and rsi3m_trend != prev_rsi3m_trend          # RSI flip
-            and price_dir_now != price_dir_prev          # PRICE DIRECTION flip
-            and wce_score >= REVERSE_WCE_MIN
-            and signal_q >= REVERSE_SIGNALQ_MIN
-        ):
-            reverse_trigger = True
-
     if prev_wce - wce_score >= EXIT_WCE_DROP:
         reasons.append(f"WCE drop {prev_wce:.0f} → {wce_score:.0f}")
 
@@ -1316,64 +1261,25 @@ def run_exit_full(snapshot):
     )
 
     if send_telegram(caption):
-        lock = state_locks[symbol]
-        with lock:
-            entry["phase"] = "EXITED"
-            entry["tracking"] = False
-            entry["exit_sent_at"] = now_ts
+        entry["phase"] = "EXITED"
+        entry["tracking"] = False
+        entry["exit_sent_at"] = now_ts
+        entry["last_notify"] = None
 
-            entry["last_notify"] = None
-
-            # --- cooldown logic (pro safe) ---
-            if reverse_trigger:
-                entry["cooldown_until"] = now_ts + REVERSE_COOLDOWN
-            else:
-                entry["cooldown_until"] = now_ts + REENTRY_COOLDOWN
-
-    if reverse_trigger:
-        reverse_snapshot = {
+        log_signal("EXIT", {
             "symbol": symbol,
-            "price": entry.get("last_price"),
+            "direction": direction,
             "pct_15m": pct_15m,
-            "vol_mult": vol_mult,
-            "volume_strength": volume_strength,
-            "short_pct": short_pct,
-            "stage_label": "REVERSAL",
-            "now_ts": now_ts,
-            "is_reverse": True,
-            "execute_after": now_ts + REVERSE_COOLDOWN,
-            "forced_direction": "SHORT" if direction == "LONG" else "LONG"  
-        }
+            "signal_q": signal_q,
+            "reasons": reasons
+        })
 
-        try:
-            task_queue.put_nowait(("START_FULL", reverse_snapshot))
-            log_signal("REVERSE_START", {
-                "symbol": symbol,
-                "from": direction,
-                "to": "SHORT" if direction == "LONG" else "LONG",
-                "wce": wce_score,
-                "signal_q": signal_q
-            })
-        except Full:
-            print("⚠️ task_queue full, REVERSE dropped:", symbol)
-
-    log_signal("EXIT", {
-        "symbol": symbol,
-        "direction": direction,
-        "pct_15m": pct_15m,
-        "signal_q": signal_q,
-        "reasons": reasons,
-        "reverse": reverse_trigger
-    })
-
-    lock = state_locks[symbol]
-    with lock:
-        entry["last_wce"] = wce_score
-        entry["last_rsi3m_trend"] = rsi3m_trend
-        entry["last_signal_q"] = signal_q
+    entry["last_wce"] = wce_score
+    entry["last_rsi3m_trend"] = rsi3m_trend
+    entry["last_signal_q"] = signal_q
 
 # ============================================================
-# ANALYSIS WORKER
+# ANALYSIS WORKER (ADDIM 5)
 # ============================================================
 
 def analysis_worker():
@@ -1381,19 +1287,9 @@ def analysis_worker():
         try:
             task, snapshot = task_queue.get()
             if task == "START_FULL":
-
-                # --- micro scheduling support (reverse cooldown) ---
-                execute_after = snapshot.get("execute_after")
-                if execute_after:
-                    wait = execute_after - time.time()
-                    if wait > 0:
-                        time.sleep(min(wait, REVERSE_COOLDOWN))
-
                 run_start_full(snapshot)
-
             elif task == "EXIT_FULL":
                 run_exit_full(snapshot)
-
         except Exception as e:
             print("analysis_worker error:", e)
         finally:
@@ -1425,29 +1321,26 @@ def _process_mini(msg):
     if price <= 0:
         return
 
-    lock = state_locks[symbol]
-    with lock:
-        entry = state.setdefault(symbol, {
-            "prices": [],
-            "vols": [],
-            "last_v": None,
-            "tracking": False,
-            "phase": "IDLE",
-            "last_notify": None
-        })
+    entry = state.setdefault(symbol, {
+        "prices": [],
+        "vols": [],
+        "last_v": None,
+        "tracking": False,
+        "phase": "IDLE",
+        "last_notify": None    
+    })
 
-        entry["prices"].append(price)
-        entry["last_price"] = price
+    entry["prices"].append(price)
 
-        if entry["last_v"] is None:
-            diff_vol = 0.0
-        else:
-            diff_vol = max(vol - entry["last_v"], 0.0)
-        entry["last_v"] = vol
-        entry["vols"].append(diff_vol)
+    if entry["last_v"] is None:
+        diff_vol = 0.0
+    else:
+        diff_vol = max(vol - entry["last_v"], 0.0)
+    entry["last_v"] = vol
+    entry["vols"].append(diff_vol)
 
-        entry["prices"] = entry["prices"][-1800:]
-        entry["vols"] = entry["vols"][-1800:]
+    entry["prices"] = entry["prices"][-1800:]
+    entry["vols"] = entry["vols"][-1800:]
 
     last_seen[symbol] = now
 
@@ -1481,35 +1374,34 @@ def _process_mini(msg):
     # STEP — TELEMETRY (NO SIGNAL)
     # ========================================================
     if entry.get("phase") == "ACTIVE":
-
-        last_step_ts = entry.get("last_step_ts", 0)
-        step_allowed = (now_ts - last_step_ts >= STEP_MIN_INTERVAL)
-    
         last_step_price = entry.get("last_step_price", price)
-        pct_from_last = (
-            (price - last_step_price) / last_step_price * 100
-            if last_step_price else 0.0
-        )
+        pct_from_last = (price - last_step_price) / last_step_price * 100 if last_step_price else 0.0
 
         if (
-            step_allowed
-            and abs(pct_from_last) >= STEP_PCT
+            abs(pct_from_last) >= STEP_PCT
             and vol_mult >= STEP_VOLUME_SPIKE
             and volume_strength >= STEP_VOLUME_STRENGTH
         ):
             entry["last_step_price"] = price
-    
+
             prev = entry.get("last_notify")
-    
+
+            # --- Δ vs previous notification (MAIN telemetry) ---
             if prev:
                 dp_pct = (price - prev["price"]) / prev["price"] * 100 if prev.get("price") else 0.0
                 d_vol = vol_mult - prev.get("vol_mult", vol_mult)
                 d_str = volume_strength - prev.get("volume_strength", volume_strength)
             else:
-                dp_pct = d_vol = d_str = 0.0
+                dp_pct = 0.0
+                d_vol = 0.0
+                d_str = 0.0
 
+            # --- Context vs START (optional, informational only) ---
             start_price = entry.get("start_price")
-            from_start = (price - start_price) / start_price * 100 if start_price else 0.0
+            from_start = (
+                (price - start_price) / start_price * 100
+                if start_price else 0.0
+            )
 
             caption = (
                 "📡 STEP — Telemetry\n"
@@ -1524,8 +1416,8 @@ def _process_mini(msg):
             )
 
             send_telegram(caption)
-    
-            entry["last_step_ts"] = now_ts
+
+            # --- Update telemetry reference ---
             entry["last_notify"] = {
                 "price": price,
                 "pct_15m": pct_15m,
@@ -1563,13 +1455,7 @@ def _process_mini(msg):
                     except Full:
                         print("⚠️ task_queue full, EXIT dropped:", symbol)
 
-    # ========================================================
-    # RE-ENTRY COOLDOWN GATE (ADDIM 5)
-    # ========================================================
-    if entry.get("phase") == "EXITED":
-        cd_until = entry.get("cooldown_until", 0)
-        if now_ts < cd_until:
-            return
+        return
 
     # ========================================================
     # START — FULL POWER (ENQUEUE ONLY)
@@ -1585,6 +1471,14 @@ def _process_mini(msg):
         and (vol_mult <= 50 or recent_1m >= FAKE_RECENT_STRONG_USDT)
     ):
 
+        entry["phase"] = "ACTIVE"
+        entry["tracking"] = True
+        entry["start_price"] = price
+        entry["last_step_price"] = price
+        entry["start_time"] = now_ts
+        entry["direction"] = "LONG" if pct_15m > 0 else "SHORT"
+        entry["last_notify"] = None
+
         snapshot = {
             "symbol": symbol,
             "price": price,
@@ -1598,28 +1492,17 @@ def _process_mini(msg):
 
         try:
             task_queue.put_nowait(("START_FULL", snapshot))
+
+            entry["last_notify"] = {
+                "price": price,
+                "pct_15m": pct_15m,
+                "vol_mult": vol_mult,
+                "volume_strength": volume_strength,
+                "ts": now_ts
+            }
+
         except Full:
             print("⚠️ task_queue full, START dropped:", symbol)
-            return
-
-        prev_prices = entry.get("prices", [])
-        prev_vols = entry.get("vols", [])
-        prev_last_v = entry.get("last_v")
-
-        entry.clear()
-        entry["prices"] = prev_prices[-1800:]
-        entry["vols"] = prev_vols[-1800:]
-        entry["last_v"] = prev_last_v
-
-        entry["phase"] = "ACTIVE"
-        entry["tracking"] = True
-        entry["start_price"] = price
-        entry["last_step_price"] = price
-        entry["start_time"] = now_ts
-        entry["direction"] = "LONG" if pct_15m > 0 else "SHORT"
-        entry["last_notify"] = None
-        entry["last_step_ts"] = now_ts
-        entry["last_exit_check"] = 0.0
 
 # ============================================================
 # HANDLE MINITICKER (unwrap 'data' if present)
@@ -1793,7 +1676,9 @@ def start_stream():
 
     try:
         info = client.futures_exchange_info()
-        syms = [s["symbol"] for s in info["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
+        syms = [s["symbol"] for s in info["symbols"]
+                if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
+
         vol_list = [(s, get_24h_volume_cached(s)) for s in syms]
         vol_list = [(s, v) for s, v in vol_list if v >= MIN24H]
 
@@ -1821,12 +1706,15 @@ def start_stream():
     ).start()
 
     try:
-        twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+        twm = ThreadedWebsocketManager(
+            api_key=BINANCE_API_KEY,
+            api_secret=BINANCE_API_SECRET
+        )
         twm.start()
         ws_manager = twm
 
         _start_miniticker_socket(twm)
-        
+
     except Exception as e:
         print("❌ Failed to start miniticker socket:", e)
         return
@@ -1859,4 +1747,3 @@ if __name__ == "__main__":
 
     while True:
         time.sleep(5)
-
