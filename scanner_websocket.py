@@ -74,7 +74,7 @@ FAKE_RECENT_STRONG_USDT = 10000
 MOMENTUM_THRESHOLD = START_PCT
 PATTERN_PCT = 3.0
 
-MIN24H = 2_000_000
+MIN24H = 1_000_000
 
 STEP_PCT = 5.0
 STEP_VOLUME_SPIKE = 2.0
@@ -1287,34 +1287,9 @@ def run_exit_full(snapshot):
     prev_rsi3m_trend = entry.get("last_rsi3m_trend")
     direction = entry.get("direction", "UNKNOWN")
 
-    tier1_reasons = []   # instant danger → single reason exit
-    tier2_reasons = []   # trend weakening → combined exit
-    tier3_reasons = []   # warnings only → no exit
+    reasons = []
 
     reverse_trigger = False
-    
-    # ====================================================
-    # TIER 1 — INSTANT EXIT (single reason is enough)
-    # ====================================================
-
-    # 1) HARD WCE COLLAPSE
-    if prev_wce - wce_score >= EXIT_WCE_DROP * 1.8:
-        tier1_reasons.append(
-            f"Hard WCE collapse {prev_wce:.0f} → {wce_score:.0f}"
-        )
-
-    # 2) FULL VOLUME DRY-UP
-    if vol_drop >= 0.75:
-        tier1_reasons.append(
-            f"Volume dried up {vol_drop*100:.0f}%"
-        )
-
-    # 3) AGGRESSIVE MICRO REVERSE + WEAK WCE
-    if wce_score < 45:
-        if direction == "LONG" and short_pct <= -2 * EXIT_MICRO_REVERSE:
-            tier1_reasons.append("Aggressive micro reverse vs LONG")
-        elif direction == "SHORT" and short_pct >= 2 * EXIT_MICRO_REVERSE:
-            tier1_reasons.append("Aggressive micro reverse vs SHORT")
 
     price_dir_now = "LONG" if pct_15m > 0 else "SHORT"
     price_dir_prev = direction  # entry-dən gəlir
@@ -1330,56 +1305,20 @@ def run_exit_full(snapshot):
             reverse_trigger = True
 
     if prev_wce - wce_score >= EXIT_WCE_DROP:
-        tier2_reasons.append(f"WCE drop {prev_wce:.0f} → {wce_score:.0f}")
+        reasons.append(f"WCE drop {prev_wce:.0f} → {wce_score:.0f}")
 
     if vol_drop >= EXIT_VOLUME_DROP:
-        tier2_reasons.append(f"Volume collapse {vol_drop*100:.0f}%")
+        reasons.append(f"Volume collapse {vol_drop*100:.0f}%")
 
     if direction == "LONG" and short_pct <= -EXIT_MICRO_REVERSE:
-        tier2_reasons.append("Micro reverse vs LONG")
+        reasons.append("Micro reverse vs LONG")
     elif direction == "SHORT" and short_pct >= EXIT_MICRO_REVERSE:
-        tier2_reasons.append("Micro reverse vs SHORT")
+        reasons.append("Micro reverse vs SHORT")
 
     if EXIT_USE_RSI3M_FLIP and prev_rsi3m_trend and rsi3m_trend != prev_rsi3m_trend:
-        tier2_reasons.append(f"RSI(3m) flip {prev_rsi3m_trend} → {rsi3m_trend}")
+        reasons.append(f"RSI(3m) flip {prev_rsi3m_trend} → {rsi3m_trend}")
 
-    # ====================================================
-    # TIER 1 EXIT — IMMEDIATE
-    # ====================================================
-    if tier1_reasons:
-
-        caption = (
-            "🚨 EXIT (INSTANT)\n"
-            f"{symbol}\n\n"
-            f"Direction: {direction} → {wce_trend}\n"
-            f"Price(15m): {pct_15m:+.2f}%\n"
-            f"SignalQ: {signal_q}/100\n\n"
-            f"Reasons:\n" + "\n".join(f"• {r}" for r in tier1_reasons)
-        )
-
-        if send_telegram(caption):
-            lock = state_locks[symbol]
-            with lock:
-                entry["phase"] = "EXITED"
-                entry["tracking"] = False
-                entry["exit_sent_at"] = now_ts
-                entry["last_notify"] = None
-                entry["cooldown_until"] = now_ts + REENTRY_COOLDOWN
-
-        log_signal("EXIT_INSTANT", {
-            "symbol": symbol,
-            "direction": direction,
-            "pct_15m": pct_15m,
-            "signal_q": signal_q,
-            "reasons": tier1_reasons
-        })
-
-        entry["last_wce"] = wce_score
-        entry["last_rsi3m_trend"] = rsi3m_trend
-        entry["last_signal_q"] = signal_q
-        return
-
-    if len(tier2_reasons) < 2:
+    if len(reasons) < 2:
         entry["last_wce"] = wce_score
         entry["last_rsi3m_trend"] = rsi3m_trend
         entry["last_signal_q"] = signal_q
@@ -1391,7 +1330,7 @@ def run_exit_full(snapshot):
         f"Direction: {direction} → {wce_trend}\n"
         f"Price(15m): {pct_15m:+.2f}%\n"
         f"SignalQ: {signal_q}/100\n\n"
-        f"Reasons:\n" + "\n".join(f"• {r}" for r in tier2_reasons)
+        f"Reasons:\n" + "\n".join(f"• {r}" for r in reasons)
     )
 
     if send_telegram(caption):
@@ -1441,7 +1380,7 @@ def run_exit_full(snapshot):
         "direction": direction,
         "pct_15m": pct_15m,
         "signal_q": signal_q,
-        "reasons": tier2_reasons,
+        "reasons": reasons,
         "reverse": reverse_trigger
     })
 
