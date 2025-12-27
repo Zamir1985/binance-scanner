@@ -1,0 +1,5 @@
+python-binance==1.0.19
+
+# http & math
+requests==2.31.0
+numpy==1.26.4
