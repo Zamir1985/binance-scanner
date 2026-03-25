@@ -101,7 +101,7 @@ REVERSE_COOLDOWN = 60  # seconds (micro cooldown for reverse)
 
 LOOKBACK_MIN = 15
 RSI_PERIOD = 14
-TOP_N = 50
+TOP_N = 30
 SHORT_WINDOW = 5
 
 RSI3M_CACHE_TTL = 20
