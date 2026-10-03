@@ -1524,9 +1524,15 @@ def heartbeat(interval_minutes=30):
 # ============================================================
 # MAIN (Railway Optimized)
 # ============================================================
-
 if __name__ == "__main__":
     print("\n📡 SCANNER STARTING (Railway Mode)...\n")
+
+    # Telegram startup notification
+    try:
+        ok = send_telegram("🚀 SCANNER STARTING (Railway Mode)")
+        print(f"📨 Startup Telegram result: {ok}")
+    except Exception as e:
+        print("❌ Startup Telegram error:", e)
 
     try:
         threading.Thread(target=start_stream, daemon=True).start()
@@ -1535,6 +1541,6 @@ if __name__ == "__main__":
     except Exception as e:
         print("❌ Failed to start background threads:", e)
 
-    # Railway-də main thread boş qalmamalıdır (container yoxsa ölür)
+    # Railway-də main thread boş qalmamalıdır
     while True:
         time.sleep(5)
