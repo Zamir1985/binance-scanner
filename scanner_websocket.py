@@ -65,7 +65,7 @@ rest_pool = ThreadPoolExecutor(max_workers=REST_POOL_SIZE)
 # CONFIG
 # ============================================================
 
-START_PCT = 3.0
+START_PCT = 5.0
 START_VOLUME_SPIKE = 3.0
 START_MIN_VOLUME_STRENGTH = 1.5
 START_MICRO_PCT = 0.05
@@ -93,15 +93,15 @@ EXIT_USE_RSI3M_FLIP = True
 EXIT_MICRO_REVERSE = 0.15
 
 REVERSE_ENABLED = True
-REVERSE_WCE_MIN = 70.0
-REVERSE_SIGNALQ_MIN = 65.0
+REVERSE_WCE_MIN = 60.0
+REVERSE_SIGNALQ_MIN = 60.0
 
 REENTRY_COOLDOWN = 180  # seconds (3 dəqiqə)
 REVERSE_COOLDOWN = 60  # seconds (micro cooldown for reverse)
 
 LOOKBACK_MIN = 15
 RSI_PERIOD = 14
-TOP_N = 20
+TOP_N = 50
 SHORT_WINDOW = 5
 
 RSI3M_CACHE_TTL = 20
