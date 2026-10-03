@@ -1,5 +1,4 @@
 python-binance==1.0.19
-
-# http & math
+websockets==11.0.3
 requests==2.31.0
 numpy==1.26.4
