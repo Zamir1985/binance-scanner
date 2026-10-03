@@ -63,7 +63,7 @@ rest_pool = ThreadPoolExecutor(max_workers=REST_POOL_SIZE)
 # CONFIG
 # ============================================================
 
-START_PCT = 5.0
+START_PCT = 4.0
 START_VOLUME_SPIKE = 3.0
 START_MIN_VOLUME_STRENGTH = 1.5
 START_MICRO_PCT = 0.05
