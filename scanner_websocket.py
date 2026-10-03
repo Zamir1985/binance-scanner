@@ -48,11 +48,13 @@ last_heartbeat_ts = 0.0
 ws_manager = None
 
 # Task queues
-task_queue = Queue(maxsize=2000)       # START/EXIT heavy work
-telegram_queue = Queue(maxsize=2000)   # Telegram messages
+task_queue = Queue(maxsize=2000)                 # START heavy work
+exit_queue = Queue(maxsize=2000)                 # EXIT heavy work (priority path)
+telegram_priority_queue = Queue(maxsize=500)     # START/EXIT messages
+telegram_queue = Queue(maxsize=2000)             # STEP/WARNING/HB messages
 
 # Workers config
-ANALYSIS_WORKERS = int(os.getenv("ANALYSIS_WORKERS", "2"))
+ANALYSIS_WORKERS = int(os.getenv("ANALYSIS_WORKERS", "4"))
 TELEGRAM_WORKERS = int(os.getenv("TELEGRAM_WORKERS", "1"))
 
 # Optional: REST pool (kept; not required for logic)
@@ -108,7 +110,7 @@ SENTIMENT_CACHE_TTL = 30
 VOL24_CACHE_TTL = 300
 
 HEARTBEAT_ENABLED = True
-HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "1800"))
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "7200"))
 
 LOG_ENABLED = True
 LOG_FILE = os.getenv("SIGNAL_LOG_FILE", "signals.log")
@@ -152,6 +154,10 @@ _http = requests.Session()
 _http.headers.update({"User-Agent": "balanced-pro-scanner/1.0"})
 # keep default adapters; Railway usually fine
 
+# REST concurrency limiter (does NOT increase API calls; reduces ban risk)
+REST_MAX_CONCURRENCY = int(os.getenv("REST_MAX_CONCURRENCY", "4"))
+rest_sem = threading.BoundedSemaphore(REST_MAX_CONCURRENCY)
+
 # ============================================================
 # MARKDOWN ESCAPE (Telegram MarkdownV2)
 # ============================================================
@@ -188,7 +194,8 @@ def log_signal(event_type, data: dict):
 
 def get_24h_volume(symbol):
     try:
-        r = _http.get(f"{FAPI}/fapi/v1/ticker/24hr", params={"symbol": symbol}, timeout=8)
+        with rest_sem:
+            r = _http.get(f"{FAPI}/fapi/v1/ticker/24hr", params={"symbol": symbol}, timeout=8)
         return float(r.json().get("quoteVolume", 0))
     except Exception:
         return 0.0
@@ -218,11 +225,12 @@ def get_24h_volume_cache_only(symbol):
 
 def get_closes(symbol, limit=100, interval="1m"):
     try:
-        r = _http.get(
-            f"{FAPI}/fapi/v1/klines",
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-            timeout=8
-        )
+        with rest_sem:
+            r = _http.get(
+                f"{FAPI}/fapi/v1/klines",
+                params={"symbol": symbol, "interval": interval, "limit": limit},
+                timeout=8
+            )
         data = r.json()
         if isinstance(data, list):
             return [float(k[4]) for k in data]
@@ -330,11 +338,12 @@ def fetch_orderbook_imbalance_cached(symbol, ttl=ORDERBOOK_CACHE_TTL):
         return entry["ratio"], entry["label"]
 
     try:
-        r = _http.get(
-            f"{FAPI}/fapi/v1/depth",
-            params={"symbol": symbol, "limit": 50},
-            timeout=5
-        )
+        with rest_sem:
+            r = _http.get(
+                f"{FAPI}/fapi/v1/depth",
+                params={"symbol": symbol, "limit": 50},
+                timeout=5
+            )
         data = r.json()
         bids = data.get("bids", [])
         asks = data.get("asks", [])
@@ -548,11 +557,12 @@ def fetch_sentiment_metrics(symbol):
     try:
         base = f"{FAPI}/futures/data"
 
-        oi = _http.get(
-            f"{base}/openInterestHist",
-            params={"symbol": symbol, "period": "15m", "limit": 2},
-            timeout=6
-        ).json()
+        with rest_sem:
+            oi = _http.get(
+                f"{base}/openInterestHist",
+                params={"symbol": symbol, "period": "15m", "limit": 2},
+                timeout=6
+            ).json()
 
         if isinstance(oi, list) and len(oi) >= 2:
             prev_oi = float(oi[0].get("sumOpenInterest", 0))
@@ -570,7 +580,8 @@ def fetch_sentiment_metrics(symbol):
 
         def fetch_ratio(url):
             try:
-                d = _http.get(url, timeout=6).json()
+                with rest_sem:
+                    d = _http.get(url, timeout=6).json()
                 if isinstance(d, list) and len(d) >= 1:
                     v = d[-1].get("longShortRatio")
                     if v is None:
@@ -585,11 +596,12 @@ def fetch_sentiment_metrics(symbol):
         metrics["glb_r"] = fetch_ratio(f"{base}/globalLongShortAccountRatio?symbol={symbol}&period=15m&limit=1")
 
         try:
-            fund = _http.get(
-                f"{base}/fundingRate",
-                params={"symbol": symbol, "limit": 20},
-                timeout=6
-            ).json()
+            with rest_sem:
+                fund = _http.get(
+                    f"{base}/fundingRate",
+                    params={"symbol": symbol, "limit": 20},
+                    timeout=6
+                ).json()
 
             current_f = None
             old_15m = None
@@ -598,7 +610,7 @@ def fetch_sentiment_metrics(symbol):
                 if isinstance(fund, list) and len(fund) >= 1:
                     x = fund[-1].get("fundingRate")
                     if x not in [None, ""]:
-                        current_f = float(x) * 100.0
+                        current_f = float(x)
             except Exception:
                 pass
 
@@ -610,13 +622,13 @@ def fetch_sentiment_metrics(symbol):
                     if candidates:
                         x2 = candidates[-1].get("fundingRate")
                         if x2 not in [None, ""]:
-                            old_15m = float(x2) * 100.0
+                            old_15m = float(x2)
             except Exception:
                 pass
 
             try:
                 if current_f is not None and old_15m is not None:
-                    metrics["funding_change"] = (current_f - old_15m)
+                    metrics["funding_change"] = (current_f - old_15m) * 100.0
                 else:
                     metrics["funding_change"] = 0.0
             except Exception:
@@ -1052,11 +1064,12 @@ def _send_telegram_sync(text):
             "text": escape_md(text),
             "parse_mode": "MarkdownV2"
         }
-        r = _http.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json=payload,
-            timeout=10
-        )
+        with rest_sem:
+            r = _http.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json=payload,
+                timeout=10
+            )
         if r.ok:
             print("📩 Telegram sent")
             return True
@@ -1067,9 +1080,12 @@ def _send_telegram_sync(text):
         print("Telegram error:", e)
         return False
 
-def send_telegram(text):
+def send_telegram(text, priority=False):
     try:
-        telegram_queue.put_nowait(text)
+        if priority:
+            telegram_priority_queue.put_nowait(text)
+        else:
+            telegram_queue.put_nowait(text)
         return True
     except Full:
         global telegram_overflow_warned
@@ -1081,8 +1097,22 @@ def send_telegram(text):
 def telegram_worker():
     while True:
         try:
+            # 1) Priority messages first (START/EXIT)
+            try:
+                text = telegram_priority_queue.get_nowait()
+                _send_telegram_sync(text)
+                try:
+                    telegram_priority_queue.task_done()
+                except:
+                    pass
+                continue
+            except Empty:
+                pass
+
+            # 2) Normal messages
             text = telegram_queue.get()
             _send_telegram_sync(text)
+
         except Exception as e:
             print("telegram_worker error:", e)
         finally:
@@ -1097,126 +1127,149 @@ def telegram_worker():
 
 def run_start_full(snapshot):
     symbol = snapshot["symbol"]
-    pct_15m = snapshot["pct_15m"]
-    vol_mult = snapshot["vol_mult"]
-    volume_strength = snapshot["volume_strength"]
-    short_pct = snapshot["short_pct"]
-    stage_label = snapshot["stage_label"]
-    is_reverse = snapshot.get("is_reverse", False)
-    forced_dir = snapshot.get("forced_direction")
 
-    direction = forced_dir if forced_dir else ("LONG" if pct_15m > 0 else "SHORT")
+    try:
+        pct_15m = snapshot["pct_15m"]
+        vol_mult = snapshot["vol_mult"]
+        volume_strength = snapshot["volume_strength"]
+        short_pct = snapshot["short_pct"]
+        stage_label = snapshot["stage_label"]
+        is_reverse = snapshot.get("is_reverse", False)
+        forced_dir = snapshot.get("forced_direction")
 
-    lock = state_locks[symbol]
-    with lock:
-        e = state.get(symbol)
-        if e:
-            e["direction"] = direction
+        direction = forced_dir if forced_dir else ("LONG" if pct_15m > 0 else "SHORT")
 
-    closes = get_closes(symbol, limit=100, interval="1m")
-    rsi = compute_rsi(closes, RSI_PERIOD)
+        lock = state_locks[symbol]
+        with lock:
+            e = state.get(symbol)
+            if e:
+                e["direction"] = direction
 
-    sentiment_text, metrics = fetch_sentiment_cached(symbol)
-    rsi3m, rsi3m_trend = fetch_rsi_3m_cached(symbol)
-    ob_ratio, ob_label = fetch_orderbook_imbalance_cached(symbol)
+        closes = get_closes(symbol, limit=100, interval="1m")
+        rsi = compute_rsi(closes, RSI_PERIOD)
 
-    vol24 = get_24h_volume_cached(symbol)      
+        sentiment_text, metrics = fetch_sentiment_cached(symbol)
+        rsi3m, rsi3m_trend = fetch_rsi_3m_cached(symbol)
+        ob_ratio, ob_label = fetch_orderbook_imbalance_cached(symbol)
 
-    base_q = compute_signal_quality(
-        rsi,
-        vol_mult,
-        metrics.get("oi_chg"),
-        metrics.get("last_f"),
-        short_pct,
-        pct_15m,
-        rsi3m,
-        ob_ratio
-    )
+        vol24 = get_24h_volume_cached(symbol)      
 
-    wce_score, _, _, _, wce_text = compute_wce(
-        metrics.get("oi_chg", 0.0) if metrics.get("oi_chg") not in ["-", None] else 0.0,
-        metrics.get("not_chg", 0.0) if metrics.get("not_chg") not in ["-", None] else 0.0,
-        metrics.get("acc_r", 1.0) if isinstance(metrics.get("acc_r"), (int, float)) else 1.0,
-        metrics.get("pos_r", 1.0) if isinstance(metrics.get("pos_r"), (int, float)) else 1.0,
-        metrics.get("glb_r", 1.0) if isinstance(metrics.get("glb_r"), (int, float)) else 1.0,
-        metrics.get("funding_change", 0.0),
-        rsi,
-        pct_15m,
-        rsi3m,
-        ob_ratio
-    )
+        base_q = compute_signal_quality(
+            rsi,
+            vol_mult,
+            metrics.get("oi_chg"),
+            metrics.get("last_f"),
+            short_pct,
+            pct_15m,
+            rsi3m,
+            ob_ratio
+        )
 
-    spot_adj = compute_spot_adjustment(
-        stage_label,
-        direction,
-        metrics.get("oi_chg"),
-        metrics.get("not_chg"),
-        metrics.get("acc_r"),
-        metrics.get("pos_r"),
-        metrics.get("glb_r"),
-        metrics.get("funding_change"),
-        wce_score
-    )
+        wce_score, _, _, _, wce_text = compute_wce(
+            metrics.get("oi_chg", 0.0),
+            metrics.get("not_chg", 0.0),
+            metrics.get("acc_r", 1.0),
+            metrics.get("pos_r", 1.0),
+            metrics.get("glb_r", 1.0),
+            metrics.get("funding_change", 0.0),
+            rsi,
+            pct_15m,
+            rsi3m,
+            ob_ratio
+        )
 
-    signal_q = max(0, min(100, base_q + spot_adj))
+        spot_adj = compute_spot_adjustment(
+            stage_label,
+            direction,
+            metrics.get("oi_chg"),
+            metrics.get("not_chg"),
+            metrics.get("acc_r"),
+            metrics.get("pos_r"),
+            metrics.get("glb_r"),
+            metrics.get("funding_change"),
+            wce_score
+        )
 
-    pattern_block = generate_pattern_analysis(
-        metrics,
-        pct_15m,
-        rsi=rsi,
-        rsi_3m=rsi3m,
-        ob_ratio=ob_ratio,
-        ob_label=ob_label,
-        stage_label=stage_label,
-        mode="full"
-    )
+        signal_q = max(0, min(100, base_q + spot_adj))
 
-    title = "🚀 START"
-    if is_reverse:
-        title = "🚀 START 🔄 REVERSE"
+        pattern_block = generate_pattern_analysis(
+            metrics,
+            pct_15m,
+            rsi=rsi,
+            rsi_3m=rsi3m,
+            ob_ratio=ob_ratio,
+            ob_label=ob_label,
+            stage_label=stage_label,
+            mode="full"
+        )
 
-    caption = (
-        f"{title}\n"
-        f"{symbol}\n\n"
-        f"📈 Change (15m): {pct_15m:+.2f}%\n"
-        f"💰 Price: {snapshot.get('price','-')}\n"
-        f"📊 Volume spike (1m/5m): ×{vol_mult:.2f}\n"
-        f"💪 Volume Strength (15m/15m): {volume_strength:.2f}x\n"
-        f"⚡ Micro Spike (short): {short_pct:+.2f}%\n"
-        f"⏳ Impulse Stage: {stage_label}\n"
-        f"📦 24h Volume: {vol24:,.0f} USDT\n"
-        f"📉 RSI(1m): {rsi}\n"
-        f"📉 RSI(3m): {rsi3m} ({rsi3m_trend})\n"
-        f"📊 Orderbook: {ob_label}\n"
-        f"{sentiment_text}\n"
-        f"🔍 Signal Quality: {signal_q}/100 "
-        f"🧮 (Base {base_q}/100, Spot {spot_adj:+d})\n\n"
-        f"{pattern_block}\n\n"
-        f"{wce_text}"
-    )
+        title = "🚀 START"
+        if is_reverse:
+            title = "🚀 START 🔄 REVERSE"
 
-    send_telegram(caption)
+        trigger_ts = snapshot.get("trigger_ts")
+        latency_s = None
+        if trigger_ts:
+            latency_s = max(0.0, time.time() - trigger_ts)
+        lat_line = f"⏱ Data latency: ~{latency_s:.1f}s\n" if latency_s is not None else ""
 
-    log_signal("START", {
-        "symbol": symbol,
-        "pct_15m": pct_15m,
-        "vol_mult": vol_mult,
-        "signal_q": signal_q,
-        "direction": direction
-    })
+        caption = (
+            f"{title}\n"
+            f"{symbol}\n"
+            f"{lat_line}\n"
+            f"📈 Change (15m): {pct_15m:+.2f}%\n"
+            f"💰 Price: {snapshot.get('price','-')}\n"
+            f"📊 Volume spike (1m/5m): ×{vol_mult:.2f}\n"
+            f"💪 Volume Strength (15m/15m): {volume_strength:.2f}x\n"
+            f"⚡ Micro Spike (short): {short_pct:+.2f}%\n"
+            f"⏳ Impulse Stage: {stage_label}\n"
+            f"📦 24h Volume: {vol24:,.0f} USDT\n"
+            f"📉 RSI(1m): {rsi}\n"
+            f"📉 RSI(3m): {rsi3m} ({rsi3m_trend})\n"
+            f"📊 Orderbook: {ob_label}\n"
+            f"{sentiment_text}\n"
+            f"🔍 Signal Quality: {signal_q}/100 "
+            f"🧮 (Base {base_q}/100, Spot {spot_adj:+d})\n\n"
+            f"{pattern_block}\n\n"
+            f"{wce_text}"
+        )
 
-    lock = state_locks[symbol]
-    with lock:
-        e = state.get(symbol)
-        if e:
-            e["phase"] = "ACTIVE"
-            e["tracking"] = True
-            e["start_time"] = snapshot.get("now_ts", time.time())
-            e["start_price"] = snapshot.get("price", e.get("last_price"))
+        send_telegram(caption, priority=True)
 
-            e["last_wce"] = wce_score
-            e["last_signal_q"] = signal_q
-            e["last_rsi3m_trend"] = rsi3m_trend
+        log_signal("START", {
+            "symbol": symbol,
+            "pct_15m": pct_15m,
+            "vol_mult": vol_mult,
+            "signal_q": signal_q,
+            "direction": direction
+        })
+ 
+        lock = state_locks[symbol]
+        with lock:
+            e = state.get(symbol)
+            if e:
+                e["phase"] = "ACTIVE"
+                e.pop("pending_start_ts", None)
+                e["start_full_done_ts"] = time.time()
+
+                e["tracking"] = True
+                e["start_time"] = snapshot.get("now_ts", time.time())
+                e["start_price"] = snapshot.get("price", e.get("last_price"))
+
+                e["last_wce"] = wce_score
+                e["last_signal_q"] = signal_q
+                e["last_rsi3m_trend"] = rsi3m_trend
+
+    except Exception as e:
+        print("run_start_full error:", e)
+        lock = state_locks[symbol]
+        with lock:
+            entry = state.get(symbol)
+            if entry and entry.get("phase") == "PENDING_START":
+                entry["phase"] = "IDLE"
+                entry["tracking"] = False
+                entry.pop("pending_start_ts", None)
+        return
 
 # ============================================================
 # EXIT FULL (heavy) — moved off WS thread
@@ -1277,9 +1330,9 @@ def run_exit_full(snapshot):
     wce_score, wce_trend, _, _, _ = compute_wce(
         metrics.get("oi_chg", 0.0) if metrics.get("oi_chg") not in ["-", None] else 0.0,
         metrics.get("not_chg", 0.0) if metrics.get("not_chg") not in ["-", None] else 0.0,
-        metrics.get("acc_r", 1.0) if isinstance(metrics.get("acc_r"), (int, float)) else 1.0,
-        metrics.get("pos_r", 1.0) if isinstance(metrics.get("pos_r"), (int, float)) else 1.0,
-        metrics.get("glb_r", 1.0) if isinstance(metrics.get("glb_r"), (int, float)) else 1.0,
+        metrics.get("acc_r", 50.0) if isinstance(metrics.get("acc_r"), (int, float)) else 50.0,
+        metrics.get("pos_r", 50.0) if isinstance(metrics.get("pos_r"), (int, float)) else 50.0,
+        metrics.get("glb_r", 50.0) if isinstance(metrics.get("glb_r"), (int, float)) else 50.0,
         metrics.get("funding_change", 0.0),
         rsi,
         pct_15m,
@@ -1386,45 +1439,13 @@ def run_exit_full(snapshot):
     ):
         if not entry.get("tier3_warned", False):
 
-            # --- confidence deltas ---
-            prev_wce_val = entry.get("last_wce")
-            prev_sigq_val = entry.get("last_signal_q")
-            prev_rsi3m = entry.get("last_rsi3m_trend")
-
-            wce_delta = None
-            sigq_delta = None
-
-            if isinstance(prev_wce_val, (int, float)):
-                wce_delta = wce_score - prev_wce_val
-
-            if isinstance(prev_sigq_val, (int, float)):
-                sigq_delta = signal_q - prev_sigq_val
-
-            delta_lines = []
-
-            if wce_delta is not None:
-                delta_lines.append(
-                    f"• WCE: {prev_wce_val:.0f} → {wce_score:.0f} ({wce_delta:+.0f})"
-                )
-
-            if sigq_delta is not None:
-                delta_lines.append(
-                    f"• SignalQ: {prev_sigq_val:.0f} → {signal_q:.0f} ({sigq_delta:+.0f})"
-                )
-
-            if prev_rsi3m and rsi3m_trend != prev_rsi3m:
-                delta_lines.append(
-                    f"• RSI(3m): {prev_rsi3m} → {rsi3m_trend}"
-                )
-
             warning_text = (
                 "⚠️ WARNING — Trend Weakening\n"
                 f"{symbol}\n\n"
                 f"Direction: {direction}\n"
-                f"Price(15m): {pct_15m:+.2f}%\n\n"
-                "Δ Confidence since last signal:\n"
-                + ("\n".join(delta_lines) if delta_lines else "• (no confidence delta)")
-                + "\n\nEarly signs:\n"
+                f"Price(15m): {pct_15m:+.2f}%\n"
+                f"SignalQ: {signal_q}/100\n\n"
+                "Early signs:\n"
                 + "\n".join(f"• {r}" for r in tier3_reasons)
             )
 
@@ -1454,7 +1475,7 @@ def run_exit_full(snapshot):
             f"Reasons:\n" + "\n".join(f"• {r}" for r in tier1_reasons)
         )
 
-        if send_telegram(caption):
+        if send_telegram(caption, priority=True):
             lock = state_locks[symbol]
             with lock:
                 entry["phase"] = "EXITED"
@@ -1493,7 +1514,7 @@ def run_exit_full(snapshot):
         f"Reasons:\n" + "\n".join(f"• {r}" for r in tier2_reasons)
     )
 
-    if send_telegram(caption):
+    if send_telegram(caption, priority=True):
         lock = state_locks[symbol]
         with lock:
             entry["phase"] = "EXITED"
@@ -1583,6 +1604,20 @@ def analysis_worker():
             except:
                 pass
 
+def exit_worker():
+    while True:
+        try:
+            task, snapshot = exit_queue.get()
+            if task == "EXIT_FULL":
+                run_exit_full(snapshot)
+        except Exception as e:
+            print("exit_worker error:", e)
+        finally:
+            try:
+                exit_queue.task_done()
+            except:
+                pass
+
 # ============================================================
 # WEBSOCKET CORE — REALTIME ENGINE (FAST)
 # ============================================================
@@ -1646,7 +1681,8 @@ def _process_mini(msg):
     recent_1m = sum(entry["vols"][-60:])
     prev_5m = sum(entry["vols"][-360:-60]) or 1
     baseline_avg_1m = prev_5m / 5
-    vol_mult = recent_1m / baseline_avg_1m if baseline_avg_1m > 0 else 1.0
+    baseline_avg_1m = max(baseline_avg_1m, 10.0)  # min baseline clamp (USDT)
+    vol_mult = recent_1m / baseline_avg_1m
 
     volume_strength = (
         sum(entry["vols"][-900:]) /
@@ -1750,7 +1786,7 @@ def _process_mini(msg):
                     entry["last_exit_enqueue_ts"] = now_ts
 
                     try:
-                        task_queue.put_nowait(("EXIT_FULL", snapshot))
+                        exit_queue.put_nowait(("EXIT_FULL", snapshot))
                     except Full:
                         print("⚠️ task_queue full, EXIT dropped:", symbol)
 
@@ -1798,7 +1834,9 @@ def _process_mini(msg):
             "volume_strength": volume_strength,
             "short_pct": short_pct,
             "stage_label": classify_impulse_stage(vol_mult, volume_strength),
-            "now_ts": now_ts
+            "now_ts": now_ts,
+            "trigger_ts": now_ts,
+            "trigger_price": price
         }
 
         try:
@@ -1817,7 +1855,8 @@ def _process_mini(msg):
         entry["vols"] = prev_vols[-1800:]
         entry["last_v"] = prev_last_v
 
-        entry["phase"] = "ACTIVE"
+        entry["phase"] = "PENDING_START"
+        entry["pending_start_ts"] = now_ts
         entry["tracking"] = True
         entry["start_price"] = price
         entry["last_step_price"] = price
@@ -1988,6 +2027,38 @@ def watchdog_loop():
 
         time.sleep(60)
 
+def cleanup_loop():
+    while True:
+        try:
+            now = time.time()
+
+            # state cleanup
+            for s in list(state.keys()):
+                ls = last_seen.get(s, 0)
+                if ls and (now - ls > 3600):  # 1 saat tick yoxdursa
+                    lock = state_locks[s]
+                    with lock:
+                        e = state.get(s)
+                        if e and e.get("phase") in ("IDLE", "EXITED"):
+                            state.pop(s, None)
+
+            # cache cleanup (purge very old)
+            def purge_cache(cache, ttl):
+                for k in list(cache.keys()):
+                    ts = cache.get(k, {}).get("ts", 0)
+                    if ts and now - ts > ttl * 5:
+                        cache.pop(k, None)
+
+            purge_cache(sentiment_cache, SENTIMENT_CACHE_TTL)
+            purge_cache(rsi3m_cache, RSI3M_CACHE_TTL)
+            purge_cache(orderbook_cache, ORDERBOOK_CACHE_TTL)
+            purge_cache(vol24_cache, VOL24_CACHE_TTL)
+
+        except Exception as e:
+            print("cleanup_loop error:", e)
+
+        time.sleep(600)  # 10 dəq
+
 # ============================================================
 # START STREAM
 # ============================================================
@@ -2057,6 +2128,8 @@ if __name__ == "__main__":
     threading.Thread(target=start_stream, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
+    threading.Thread(target=exit_worker, daemon=True).start()
+    threading.Thread(target=cleanup_loop, daemon=True).start()
 
     try:
         send_telegram("🚀 Scanner started")
