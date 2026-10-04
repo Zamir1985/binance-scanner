@@ -1,3 +1,9 @@
 python-binance==1.0.19
-requests
-numpy
+
+# websocket stack (CRITICAL)
+websockets==10.4
+aiohttp==3.8.6
+
+# http & math
+requests==2.31.0
+numpy==1.26.4
