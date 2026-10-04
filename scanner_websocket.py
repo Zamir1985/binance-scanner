@@ -1330,9 +1330,9 @@ def run_exit_full(snapshot):
     wce_score, wce_trend, _, _, _ = compute_wce(
         metrics.get("oi_chg", 0.0) if metrics.get("oi_chg") not in ["-", None] else 0.0,
         metrics.get("not_chg", 0.0) if metrics.get("not_chg") not in ["-", None] else 0.0,
-        metrics.get("acc_r", 1.0) if isinstance(metrics.get("acc_r"), (int, float)) else 1.0,
-        metrics.get("pos_r", 1.0) if isinstance(metrics.get("pos_r"), (int, float)) else 1.0,
-        metrics.get("glb_r", 1.0) if isinstance(metrics.get("glb_r"), (int, float)) else 1.0,
+        metrics.get("acc_r", 50.0) if isinstance(metrics.get("acc_r"), (int, float)) else 50.0,
+        metrics.get("pos_r", 50.0) if isinstance(metrics.get("pos_r"), (int, float)) else 50.0,
+        metrics.get("glb_r", 50.0) if isinstance(metrics.get("glb_r"), (int, float)) else 50.0,
         metrics.get("funding_change", 0.0),
         rsi,
         pct_15m,
@@ -1907,21 +1907,30 @@ def ws_monitor(min_active=10, check_interval=30):
         try:
             now = time.time()
 
-            min_req = (
-                min(min_active, max(2, len(tracked_syms)//3))
-                if tracked_syms else min_active
-            )
-
-            active = sum(
-                1 for s in tracked_syms
-                if last_seen.get(s, 0) > now - 90
-            )
+            min_req = min(min_active, max(2, len(tracked_syms)//3)) if tracked_syms else min_active
+            active = sum(1 for s in tracked_syms if last_seen.get(s, 0) > now - 90)
 
             if active < min_req and now - START_TIME > 120:
-                print(
-                    f"⚠ WS monitor: {active}/{min_req} active — "
-                    f"WS data problem detected"
-                )
+                print(f"⚠ WS monitor: {active}/{min_req} active — reconnecting WS")
+
+                try:
+                    if ws_manager:
+                        ws_manager.stop()
+                        time.sleep(2)
+                except:
+                    pass
+
+                try:
+                    twm = ThreadedWebsocketManager(
+                        api_key=BINANCE_API_KEY,
+                        api_secret=BINANCE_API_SECRET
+                    )
+                    twm.start()
+                    ws_manager = twm
+                    _start_miniticker_socket(twm)
+                    print("🔁 WebSocket reconnected")
+                except Exception as e:
+                    print("WS reconnect failed:", e)
 
             time.sleep(check_interval)
 
