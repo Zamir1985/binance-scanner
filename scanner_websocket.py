@@ -1910,26 +1910,7 @@ def ws_monitor(min_active=10, check_interval=30):
             active = sum(1 for s in tracked_syms if last_seen.get(s, 0) > now - 90)
 
             if active < min_req and now - START_TIME > 120:
-                print(f"⚠ WS monitor: {active}/{min_req} active — reconnecting WS")
-
-                try:
-                    if ws_manager:
-                        ws_manager.stop()
-                        time.sleep(2)
-                except:
-                    pass
-
-                try:
-                    twm = ThreadedWebsocketManager(
-                        api_key=BINANCE_API_KEY,
-                        api_secret=BINANCE_API_SECRET
-                    )
-                    twm.start()
-                    ws_manager = twm
-                    _start_miniticker_socket(twm)
-                    print("🔁 WebSocket reconnected")
-                except Exception as e:
-                    print("WS reconnect failed:", e)
+                print(f"⚠ WS monitor: {active}/{min_req} active — WS data problem detected")
 
             time.sleep(check_interval)
 
