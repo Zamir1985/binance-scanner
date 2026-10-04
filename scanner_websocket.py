@@ -1893,12 +1893,11 @@ def handle_miniticker(msg):
 # ============================================================
 
 def _start_miniticker_socket(twm: ThreadedWebsocketManager):
-    streams = ["!miniTicker@arr"]
-    twm.start_futures_multiplex_socket(
-        streams=streams,
+    twm.start_miniticker_socket(
         callback=handle_miniticker
     )
-    print("📡 Subscribed to FUTURES MINITICKER multiplex stream.")
+    print("📡 Subscribed to FUTURES MINITICKER stream.")
+
 
 def ws_monitor(min_active=10, check_interval=30):
     global ws_manager
@@ -1907,30 +1906,21 @@ def ws_monitor(min_active=10, check_interval=30):
         try:
             now = time.time()
 
-            min_req = min(min_active, max(2, len(tracked_syms)//3)) if tracked_syms else min_active
-            active = sum(1 for s in tracked_syms if last_seen.get(s, 0) > now - 90)
+            min_req = (
+                min(min_active, max(2, len(tracked_syms)//3))
+                if tracked_syms else min_active
+            )
+
+            active = sum(
+                1 for s in tracked_syms
+                if last_seen.get(s, 0) > now - 90
+            )
 
             if active < min_req and now - START_TIME > 120:
-                print(f"⚠ WS monitor: {active}/{min_req} active — reconnecting WS")
-
-                try:
-                    if ws_manager:
-                        ws_manager.stop()
-                        time.sleep(2)
-                except:
-                    pass
-
-                try:
-                    twm = ThreadedWebsocketManager(
-                        api_key=BINANCE_API_KEY,
-                        api_secret=BINANCE_API_SECRET
-                    )
-                    twm.start()
-                    ws_manager = twm
-                    _start_miniticker_socket(twm)
-                    print("🔁 WebSocket reconnected")
-                except Exception as e:
-                    print("WS reconnect failed:", e)
+                print(
+                    f"⚠ WS monitor: {active}/{min_req} active — "
+                    f"WS data problem detected"
+                )
 
             time.sleep(check_interval)
 
