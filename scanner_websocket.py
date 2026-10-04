@@ -1330,9 +1330,9 @@ def run_exit_full(snapshot):
     wce_score, wce_trend, _, _, _ = compute_wce(
         metrics.get("oi_chg", 0.0) if metrics.get("oi_chg") not in ["-", None] else 0.0,
         metrics.get("not_chg", 0.0) if metrics.get("not_chg") not in ["-", None] else 0.0,
-        metrics.get("acc_r", 50.0) if isinstance(metrics.get("acc_r"), (int, float)) else 50.0,
-        metrics.get("pos_r", 50.0) if isinstance(metrics.get("pos_r"), (int, float)) else 50.0,
-        metrics.get("glb_r", 50.0) if isinstance(metrics.get("glb_r"), (int, float)) else 50.0,
+        metrics.get("acc_r", 1.0) if isinstance(metrics.get("acc_r"), (int, float)) else 1.0,
+        metrics.get("pos_r", 1.0) if isinstance(metrics.get("pos_r"), (int, float)) else 1.0,
+        metrics.get("glb_r", 1.0) if isinstance(metrics.get("glb_r"), (int, float)) else 1.0,
         metrics.get("funding_change", 0.0),
         rsi,
         pct_15m,
