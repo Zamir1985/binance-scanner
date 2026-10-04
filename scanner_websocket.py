@@ -1893,12 +1893,11 @@ def handle_miniticker(msg):
 # ============================================================
 
 def _start_miniticker_socket(twm: ThreadedWebsocketManager):
-    streams = ["!miniTicker@arr"]
-    twm.start_futures_multiplex_socket(
-        streams=streams,
+    twm.start_symbol_ticker_futures_socket(
+        symbol="BTCUSDT",
         callback=handle_miniticker
     )
-    print("📡 Subscribed to FUTURES MINITICKER multiplex stream.")
+    print("📡 TEST: BTCUSDT FUTURES ticker socket started.")
 
 def ws_monitor(min_active=10, check_interval=30):
     global ws_manager
