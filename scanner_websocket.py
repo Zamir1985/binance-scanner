@@ -445,7 +445,6 @@ def _process_mini(msg):
         }
 
         try:
-            try:
             task_queue.put_nowait(("START_FULL", snapshot))
         except Full:
             print("⚠️ task_queue full, START dropped:", symbol)
