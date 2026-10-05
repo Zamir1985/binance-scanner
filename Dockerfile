@@ -10,7 +10,6 @@ RUN pip install --upgrade pip setuptools wheel
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN python -c "import websockets; print('WEBSOCKETS_VERSION:', websockets.__version__)"
 
 COPY scanner_websocket.py .
 
