@@ -16,7 +16,6 @@ import functools
 print = functools.partial(print, flush=True)
 
 from queue import Queue, Full, Empty
-from concurrent.futures import ThreadPoolExecutor
 
 from collections import defaultdict
 state_locks = defaultdict(threading.Lock)
@@ -348,8 +347,7 @@ def _process_mini(msg):
             "vols": [],
             "last_v": None,
             "tracking": False,
-            "phase": "IDLE",
-            "last_notify": None
+            "phase": "IDLE",            
         })
 
         entry["prices"].append(price)
@@ -400,9 +398,7 @@ def _process_mini(msg):
     last_start_ts = entry.get("last_start_sent_ts", 0.0)
     if now_ts - last_start_ts < REENTRY_COOLDOWN:
         return
-
-    entry["last_start_sent_ts"] = now_ts
-
+    
     if (
         abs(pct_15m) >= START_PCT
         and vol_mult >= START_VOLUME_SPIKE
@@ -428,31 +424,33 @@ def _process_mini(msg):
             "trigger_price": price
         }
 
-        try:
-            task_queue.put_nowait(("START_FULL", snapshot))
-        except Full:
-            print("⚠️ task_queue full, START dropped:", symbol)
-            return
+        lock = state_locks[symbol]
 
-        prev_prices = entry.get("prices", [])
-        prev_vols = entry.get("vols", [])
-        prev_last_v = entry.get("last_v")
-        prev_last_start_ts = entry.get("last_start_sent_ts", 0.0)
+        with lock:
+            try:
+                task_queue.put_nowait(("START_FULL", snapshot))
+            except Full:
+                print("⚠️ task_queue full, START dropped:", symbol)
+                return
 
-        entry.clear()
-        entry["prices"] = prev_prices[-1800:]
-        entry["vols"] = prev_vols[-1800:]
-        entry["last_v"] = prev_last_v
-        entry["last_start_sent_ts"] = prev_last_start_ts
+            prev_prices = entry.get("prices", [])
+            prev_vols = entry.get("vols", [])
+            prev_last_v = entry.get("last_v")
 
-        entry["phase"] = "PENDING_START"
-        entry["pending_start_ts"] = now_ts
-        entry["tracking"] = True
-        entry["start_price"] = price
-        entry["start_time"] = now_ts
-        entry["direction"] = "LONG" if pct_15m > 0 else "SHORT"
-        entry["last_notify"] = None
+            entry.clear()
 
+            entry["prices"] = prev_prices[-1800:]
+            entry["vols"] = prev_vols[-1800:]
+            entry["last_v"] = prev_last_v
+            entry["last_start_sent_ts"] = now_ts
+
+            entry["phase"] = "PENDING_START"
+            entry["pending_start_ts"] = now_ts
+            entry["tracking"] = True
+            entry["start_price"] = price
+            entry["start_time"] = now_ts
+            entry["direction"] = "LONG" if pct_15m > 0 else "SHORT"
+        
 # ============================================================
 # HANDLE MINITICKER (unwrap 'data' if present)
 # ============================================================
@@ -476,8 +474,19 @@ def handle_miniticker(msg):
         print("handle_miniticker error:", e)
 
 # ============================================================
-# WEBSOCKET MONITOR — Railway Stable Version
+# WEBSOCKET MONITOR (FUTURES MULTIPLEX)
 # ============================================================
+
+def _start_miniticker_socket(twm: ThreadedWebsocketManager):
+    streams = ["!miniTicker@arr"]
+
+    twm.start_futures_multiplex_socket(
+        streams=streams,
+        callback=handle_miniticker
+    )
+
+    print("📡 Subscribed to FUTURES MINITICKER multiplex stream.")
+
 
 def ws_monitor(min_active=10, check_interval=30):
     global ws_manager
@@ -486,18 +495,24 @@ def ws_monitor(min_active=10, check_interval=30):
         try:
             now = time.time()
 
+            min_req = (
+                min(min_active, max(2, len(tracked_syms)//3))
+                if tracked_syms
+                else min_active
+            )
+
             active = sum(
                 1 for s in tracked_syms
                 if last_seen.get(s, 0) > now - 90
             )
 
-            if active < min_active:
+            if active < min_req and now - START_TIME > 120:
                 print(
-                    f"⚠ WS monitor: Only {active} active symbols — reconnecting WS..."
+                    f"⚠ WS monitor: {active}/{min_req} active — reconnecting WS"
                 )
 
                 try:
-                    if ws_manager is not None:
+                    if ws_manager:
                         ws_manager.stop()
                         time.sleep(2)
                 except:
@@ -508,17 +523,16 @@ def ws_monitor(min_active=10, check_interval=30):
                         api_key=BINANCE_API_KEY,
                         api_secret=BINANCE_API_SECRET
                     )
+
                     twm.start()
                     ws_manager = twm
 
-                    twm.start_miniticker_socket(
-                        callback=handle_miniticker
-                    )
+                    _start_miniticker_socket(twm)
 
-                    print("🔁 WebSocket reconnected successfully.")
+                    print("🔁 WebSocket reconnected")
 
                 except Exception as e:
-                    print("❌ WS reconnect failed:", e)
+                    print("WS reconnect failed:", e)
 
             time.sleep(check_interval)
 
@@ -623,7 +637,7 @@ def cleanup_loop():
             # state cleanup
             for s in list(state.keys()):
                 ls = last_seen.get(s, 0)
-                if ls and (now - ls > 3600):  # 1 saat tick yoxdursa
+                if ls and (now - ls > 3600):  # no tick for 1 hour
                     lock = state_locks[s]
                     with lock:
                         e = state.get(s)
@@ -687,10 +701,7 @@ def start_stream():
         twm.start()
         ws_manager = twm
 
-        twm.start_miniticker_socket(
-            callback=handle_miniticker
-        )
-        print("📡 Subscribed to FUTURES MINITICKER stream.")
+        _start_miniticker_socket(twm)
         
     except Exception as e:
         print("❌ Failed to start miniticker socket:", e)
