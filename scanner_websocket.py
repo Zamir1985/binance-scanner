@@ -54,7 +54,6 @@ TELEGRAM_WORKERS = int(os.getenv("TELEGRAM_WORKERS", "1"))
 START_PCT = 5.0
 START_VOLUME_SPIKE = 3.0
 START_MIN_VOLUME_STRENGTH = 1.5
-START_MICRO_PCT = 0.05
 
 FAKE_VOLUME_STRENGTH = 1.5
 FAKE_RECENT_MIN_USDT = 2000
@@ -379,8 +378,6 @@ def _process_mini(msg):
         entry["vols"] = entry["vols"][-1800:]
 
     last_seen[symbol] = now
-    if symbol in tracked_syms:
-        print("✅ TRACKED TICK:", symbol, "prices=", len(entry["prices"]), "vols=", len(entry["vols"]))
 
     prices = entry["prices"]
     plen = len(prices)
@@ -421,8 +418,7 @@ def _process_mini(msg):
     if (
         abs(pct_15m) >= START_PCT
         and vol_mult >= START_VOLUME_SPIKE
-        and abs(short_pct) >= START_MICRO_PCT
-
+        
         # --- START PRE-FILTER (PRO GATE) ---
         and volume_strength >= START_MIN_VOLUME_STRENGTH
         and classify_impulse_stage(vol_mult, volume_strength) != "LATE"
@@ -476,8 +472,6 @@ def _process_mini(msg):
 # ============================================================
 
 def handle_miniticker(msg):
-    print("🔥 MINITICKER CALLBACK RECEIVED:", type(msg), str(msg)[:500])
-
     try:
         if msg is None:
             return
