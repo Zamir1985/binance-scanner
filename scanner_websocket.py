@@ -478,14 +478,11 @@ def handle_miniticker(msg):
 # ============================================================
 
 def _start_miniticker_socket(twm: ThreadedWebsocketManager):
-    streams = ["!miniTicker@arr"]
-
-    twm.start_futures_multiplex_socket(
-        streams=streams,
+    twm.start_miniticker_socket(
         callback=handle_miniticker
     )
 
-    print("📡 Subscribed to FUTURES MINITICKER multiplex stream.")
+    print("📡 Subscribed to FUTURES MINITICKER stream.")
 
 
 def ws_monitor(min_active=10, check_interval=30):
