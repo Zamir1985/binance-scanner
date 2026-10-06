@@ -80,15 +80,6 @@ WATCHDOG_ENABLED = True
 WATCHDOG_NO_MSG_TIMEOUT = int(os.getenv("WATCHDOG_NO_MSG_TIMEOUT", "1200"))
 WATCHDOG_MIN_UPTIME = 300
 
-def classify_impulse_stage(vol_mult, volume_strength):
-    if vol_mult < 4.0 and volume_strength < 2.0:
-        return "EARLY"
-
-    if vol_mult < 6.0 and volume_strength < 2.5:
-        return "MID"
-
-    return "LATE"
-
 # ============================================================
 # API KEYS
 # ============================================================
@@ -259,21 +250,18 @@ def run_start_full(snapshot):
         vol_mult = snapshot["vol_mult"]
         volume_strength = snapshot["volume_strength"]
         short_pct = snapshot["short_pct"]
-        stage_label = snapshot["stage_label"]
-
+        
         direction = "LONG" if pct_15m > 0 else "SHORT"
 
         vol24 = get_24h_volume_cached(symbol)
 
         caption = (
-            "🚀 START\n"
             f"{symbol}\n\n"
             f"📈 Change (15m): {pct_15m:+.2f}%\n"
             f"💰 Price: {snapshot.get('price', '-')}\n"
             f"📊 Volume spike (1m/5m): ×{vol_mult:.2f}\n"
             f"💪 Volume Strength (15m/15m): {volume_strength:.2f}x\n"
             f"⚡ Micro Spike (short): {short_pct:+.2f}%\n"
-            f"⏳ Impulse Stage: {stage_label}\n"
             f"📦 24h Volume: {vol24:,.0f} USDT\n"
         )
 
@@ -421,8 +409,7 @@ def _process_mini(msg):
         
         # --- START PRE-FILTER (PRO GATE) ---
         and volume_strength >= START_MIN_VOLUME_STRENGTH
-        and classify_impulse_stage(vol_mult, volume_strength) != "LATE"
-
+        
         # --- FAKE SPIKE PROTECTION (RESTORED) ---
         and volume_strength >= FAKE_VOLUME_STRENGTH
         and recent_1m >= FAKE_RECENT_MIN_USDT
@@ -436,7 +423,6 @@ def _process_mini(msg):
             "vol_mult": vol_mult,
             "volume_strength": volume_strength,
             "short_pct": short_pct,
-            "stage_label": classify_impulse_stage(vol_mult, volume_strength),
             "now_ts": now_ts,
             "trigger_ts": now_ts,
             "trigger_price": price
