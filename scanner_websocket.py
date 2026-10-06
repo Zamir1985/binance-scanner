@@ -379,6 +379,8 @@ def _process_mini(msg):
         entry["vols"] = entry["vols"][-1800:]
 
     last_seen[symbol] = now
+    if symbol in tracked_syms:
+        print("✅ TRACKED TICK:", symbol, "prices=", len(entry["prices"]), "vols=", len(entry["vols"]))
 
     prices = entry["prices"]
     plen = len(prices)
