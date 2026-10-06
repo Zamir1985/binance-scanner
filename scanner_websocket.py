@@ -474,7 +474,7 @@ def _process_mini(msg):
 # ============================================================
 
 def handle_miniticker(msg):
-    print("🔥 MINITICKER CALLBACK RECEIVED")
+    print("🔥 MINITICKER CALLBACK RECEIVED:", type(msg), str(msg)[:500])
 
     try:
         if msg is None:
