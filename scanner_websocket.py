@@ -53,13 +53,9 @@ TELEGRAM_WORKERS = int(os.getenv("TELEGRAM_WORKERS", "1"))
 START_PCT = 5.0
 START_VOLUME_SPIKE = 3.0
 START_MIN_VOLUME_STRENGTH = 1.5
-
-FAKE_VOLUME_STRENGTH = 1.5
 FAKE_RECENT_MIN_USDT = 2000
 FAKE_RECENT_STRONG_USDT = 10000
-
 MIN24H = 2_000_000
-
 REENTRY_COOLDOWN = 180  # seconds (3 dəqiqə)
 
 TOP_N = 50
@@ -395,10 +391,6 @@ def _process_mini(msg):
     # ========================================================
     # START — FULL POWER (ENQUEUE ONLY)
     # ========================================================
-    last_start_ts = entry.get("last_start_sent_ts", 0.0)
-    if now_ts - last_start_ts < REENTRY_COOLDOWN:
-        return
-    
     if (
         abs(pct_15m) >= START_PCT
         and vol_mult >= START_VOLUME_SPIKE
@@ -407,7 +399,6 @@ def _process_mini(msg):
         and volume_strength >= START_MIN_VOLUME_STRENGTH
         
         # --- FAKE SPIKE PROTECTION (RESTORED) ---
-        and volume_strength >= FAKE_VOLUME_STRENGTH
         and recent_1m >= FAKE_RECENT_MIN_USDT
         and (vol_mult <= 50 or recent_1m >= FAKE_RECENT_STRONG_USDT)
     ):
@@ -427,6 +418,11 @@ def _process_mini(msg):
         lock = state_locks[symbol]
 
         with lock:
+            last_start_ts = entry.get("last_start_sent_ts", 0.0)
+
+            if now_ts - last_start_ts < REENTRY_COOLDOWN:
+                return
+
             try:
                 task_queue.put_nowait(("START_FULL", snapshot))
             except Full:
@@ -666,9 +662,41 @@ def start_stream():
 
     try:
         info = client.futures_exchange_info()
-        syms = [s["symbol"] for s in info["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
-        vol_list = [(s, get_24h_volume_cached(s)) for s in syms]
-        vol_list = [(s, v) for s, v in vol_list if v >= MIN24H]
+
+        syms = [
+            s["symbol"]
+            for s in info["symbols"]
+            if s["quoteAsset"] == "USDT"
+            and s["status"] == "TRADING"
+        ]
+
+        all_tickers = client.futures_ticker()
+
+        now_cache = time.time()
+        vol_map = {}
+
+        for ticker in all_tickers:
+            symbol = ticker.get("symbol")
+            if symbol:
+                volume = float(ticker.get("quoteVolume", 0) or 0)
+
+                vol_map[symbol] = volume
+
+                vol24_cache[symbol] = {
+                    "ts": now_cache,
+                    "value": volume
+                }
+
+        vol_list = [
+            (s, vol_map.get(s, 0.0))
+            for s in syms
+        ]
+
+        vol_list = [
+            (s, v)
+            for s, v in vol_list
+            if v >= MIN24H
+        ]
 
         vol_list.sort(key=lambda x: x[1], reverse=True)
         top_syms = [s for s, v in vol_list[:TOP_N]]
@@ -686,12 +714,6 @@ def start_stream():
         return
 
     tracked_syms = set(top_syms)
-
-    threading.Thread(
-        target=warmup_vol24,
-        args=(list(tracked_syms),),
-        daemon=True
-    ).start()
 
     try:
         twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
