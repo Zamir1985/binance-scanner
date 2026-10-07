@@ -29,6 +29,10 @@ last_seen = {}         # symbol timestamp monitor
 tracked_syms = set()
 telegram_overflow_warned = False
 
+# Temporary debug: verify live WebSocket ticks and history growth
+debug_tick_counts = defaultdict(int)
+debug_tick_marks = set()
+
 # Uptime / monitor states
 START_TIME = time.time()
 last_any_msg_ts = 0.0
@@ -51,10 +55,10 @@ TELEGRAM_WORKERS = int(os.getenv("TELEGRAM_WORKERS", "1"))
 # ============================================================
 
 START_PCT = 2.0
-START_VOLUME_SPIKE = 2.0
+START_VOLUME_SPIKE = 1.2
 START_MIN_VOLUME_STRENGTH = 1.2
-FAKE_RECENT_MIN_USDT = 1000
-FAKE_RECENT_STRONG_USDT = 5000
+FAKE_RECENT_MIN_USDT = 500
+FAKE_RECENT_STRONG_USDT = 1000
 MIN24H = 1_000_000
 REENTRY_COOLDOWN = 180  # seconds (3 dəqiqə)
 
@@ -320,6 +324,15 @@ def _process_mini(msg):
 
     if price <= 0:
         return
+
+    # Temporary debug: prove WebSocket -> callback -> _process_mini()
+    debug_tick_counts[symbol] += 1
+    tick_count = debug_tick_counts[symbol]
+
+    for mark in (1, 100, 300, 600, 900):
+        if tick_count >= mark and (symbol, mark) not in debug_tick_marks:
+            debug_tick_marks.add((symbol, mark))
+            print(f"📡 DATA OK: {symbol} | ticks={tick_count}")
 
     lock = state_locks[symbol]
     with lock:
