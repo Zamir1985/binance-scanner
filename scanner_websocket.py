@@ -29,10 +29,6 @@ last_seen = {}         # symbol timestamp monitor
 tracked_syms = set()
 telegram_overflow_warned = False
 
-# Temporary debug: verify live WebSocket ticks and history growth
-debug_tick_counts = defaultdict(int)
-debug_tick_marks = set()
-
 # Uptime / monitor states
 START_TIME = time.time()
 last_any_msg_ts = 0.0
@@ -54,12 +50,16 @@ TELEGRAM_WORKERS = int(os.getenv("TELEGRAM_WORKERS", "1"))
 # CONFIG
 # ============================================================
 
-START_PCT = 2.0
-START_VOLUME_SPIKE = 1.2
+START_PCT = 3.0
+START_VOLUME_SPIKE = 2.0
 START_MIN_VOLUME_STRENGTH = 1.2
-FAKE_RECENT_MIN_USDT = 500
-FAKE_RECENT_STRONG_USDT = 1000
-MIN24H = 1_000_000
+
+FAKE_VOLUME_STRENGTH = 1.2
+FAKE_RECENT_MIN_USDT = 1000
+FAKE_RECENT_STRONG_USDT = 5000
+
+MIN24H = 2_000_000
+
 REENTRY_COOLDOWN = 180  # seconds (3 dəqiqə)
 
 TOP_N = 50
@@ -153,6 +153,21 @@ def get_24h_volume_cached(symbol):
     v = get_24h_volume(symbol)
     vol24_cache[symbol] = {"ts": now, "value": v}
     return v
+
+# ============================================================
+# VOL24 CACHE WARMUP (NON-WS)
+# ============================================================
+
+def warmup_vol24(symbols):
+    """
+    WS-dən kənarda 24h volume cache doldurur.
+    REST burda icazəlidir.
+    """
+    for s in symbols:
+        try:
+            get_24h_volume_cached(s)
+        except Exception:
+            pass
 
 # ============================================================
 # TELEGRAM (async queue)
@@ -325,15 +340,6 @@ def _process_mini(msg):
     if price <= 0:
         return
 
-    # Temporary debug: prove WebSocket -> callback -> _process_mini()
-    debug_tick_counts[symbol] += 1
-    tick_count = debug_tick_counts[symbol]
-
-    for mark in (1, 100, 300, 600, 900):
-        if tick_count >= mark and (symbol, mark) not in debug_tick_marks:
-            debug_tick_marks.add((symbol, mark))
-            print(f"📡 DATA OK: {symbol} | ticks={tick_count}")
-
     lock = state_locks[symbol]
     with lock:
         entry = state.setdefault(symbol, {
@@ -359,10 +365,7 @@ def _process_mini(msg):
 
     last_seen[symbol] = now
 
-    with lock:
-        prices = entry["prices"][:]
-        vols = entry["vols"][:]
-
+    prices = entry["prices"]
     plen = len(prices)
 
     if plen <= LOOKBACK_MIN * 60:
@@ -373,15 +376,15 @@ def _process_mini(msg):
     price_15m_ago = prices[-LOOKBACK_MIN * 60]
     pct_15m = (price - price_15m_ago) / price_15m_ago * 100 if price_15m_ago else 0.0
 
-    recent_1m = sum(vols[-60:])
-    prev_5m = sum(vols[-360:-60]) or 1
+    recent_1m = sum(entry["vols"][-60:])
+    prev_5m = sum(entry["vols"][-360:-60]) or 1
     baseline_avg_1m = prev_5m / 5
     baseline_avg_1m = max(baseline_avg_1m, 10.0)  # min baseline clamp (USDT)
     vol_mult = recent_1m / baseline_avg_1m
 
     volume_strength = (
-        sum(vols[-900:]) /
-        max(sum(vols[-1800:-900]), 1)
+        sum(entry["vols"][-900:]) /
+        max(sum(entry["vols"][-1800:-900]), 1)
     )
 
     short_base = prices[-SHORT_WINDOW]
@@ -392,6 +395,10 @@ def _process_mini(msg):
     # ========================================================
     # START — FULL POWER (ENQUEUE ONLY)
     # ========================================================
+    last_start_ts = entry.get("last_start_sent_ts", 0.0)
+    if now_ts - last_start_ts < REENTRY_COOLDOWN:
+        return
+    
     if (
         abs(pct_15m) >= START_PCT
         and vol_mult >= START_VOLUME_SPIKE
@@ -400,6 +407,7 @@ def _process_mini(msg):
         and volume_strength >= START_MIN_VOLUME_STRENGTH
         
         # --- FAKE SPIKE PROTECTION (RESTORED) ---
+        and volume_strength >= FAKE_VOLUME_STRENGTH
         and recent_1m >= FAKE_RECENT_MIN_USDT
         and (vol_mult <= 50 or recent_1m >= FAKE_RECENT_STRONG_USDT)
     ):
@@ -419,11 +427,6 @@ def _process_mini(msg):
         lock = state_locks[symbol]
 
         with lock:
-            last_start_ts = entry.get("last_start_sent_ts", 0.0)
-
-            if now_ts - last_start_ts < REENTRY_COOLDOWN:
-                return
-
             try:
                 task_queue.put_nowait(("START_FULL", snapshot))
             except Full:
@@ -663,41 +666,9 @@ def start_stream():
 
     try:
         info = client.futures_exchange_info()
-
-        syms = [
-            s["symbol"]
-            for s in info["symbols"]
-            if s["quoteAsset"] == "USDT"
-            and s["status"] == "TRADING"
-        ]
-
-        all_tickers = client.futures_ticker()
-
-        now_cache = time.time()
-        vol_map = {}
-
-        for ticker in all_tickers:
-            symbol = ticker.get("symbol")
-            if symbol:
-                volume = float(ticker.get("quoteVolume", 0) or 0)
-
-                vol_map[symbol] = volume
-
-                vol24_cache[symbol] = {
-                    "ts": now_cache,
-                    "value": volume
-                }
-
-        vol_list = [
-            (s, vol_map.get(s, 0.0))
-            for s in syms
-        ]
-
-        vol_list = [
-            (s, v)
-            for s, v in vol_list
-            if v >= MIN24H
-        ]
+        syms = [s["symbol"] for s in info["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
+        vol_list = [(s, get_24h_volume_cached(s)) for s in syms]
+        vol_list = [(s, v) for s, v in vol_list if v >= MIN24H]
 
         vol_list.sort(key=lambda x: x[1], reverse=True)
         top_syms = [s for s, v in vol_list[:TOP_N]]
@@ -708,13 +679,19 @@ def start_stream():
 
     except Exception as e:
         print("Symbol load error:", e)
-        os._exit(1)
+        return
 
     if not top_syms:
         print("⚠ No symbols to track! Increase MIN24H.")
-        os._exit(1)
+        return
 
     tracked_syms = set(top_syms)
+
+    threading.Thread(
+        target=warmup_vol24,
+        args=(list(tracked_syms),),
+        daemon=True
+    ).start()
 
     try:
         twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
@@ -725,11 +702,10 @@ def start_stream():
         
     except Exception as e:
         print("❌ Failed to start miniticker socket:", e)
-        os._exit(1)
+        return
 
     threading.Thread(target=ws_monitor, daemon=True).start()
     print("🚀 Scanner started (WebSocket + Monitor)")
-    send_telegram("🚀 Scanner started")
 
 # ============================================================
 # MAIN
@@ -749,6 +725,11 @@ if __name__ == "__main__":
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=cleanup_loop, daemon=True).start()
+
+    try:
+        send_telegram("🚀 Scanner started")
+    except:
+        pass
 
     while True:
         time.sleep(5)
