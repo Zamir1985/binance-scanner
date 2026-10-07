@@ -56,9 +56,10 @@ START_MIN_VOLUME_STRENGTH = 1.5
 FAKE_RECENT_MIN_USDT = 2000
 FAKE_RECENT_STRONG_USDT = 10000
 MIN24H = 2_000_000
+
+DYNAMIC_VOLUME_REFRESH = 300  # 5 dəqiqədən bir 24h universe yenilə
 REENTRY_COOLDOWN = 180  # seconds (3 dəqiqə)
 
-TOP_N = 50
 LOOKBACK_MIN = 15
 SHORT_WINDOW = 5
 VOL24_CACHE_TTL = 300
@@ -151,19 +152,92 @@ def get_24h_volume_cached(symbol):
     return v
 
 # ============================================================
-# VOL24 CACHE WARMUP (NON-WS)
+# DYNAMIC 24H VOLUME UNIVERSE
 # ============================================================
 
-def warmup_vol24(symbols):
-    """
-    WS-dən kənarda 24h volume cache doldurur.
-    REST burda icazəlidir.
-    """
-    for s in symbols:
+def refresh_tracked_symbols():
+    global tracked_syms
+
+    try:
+        with rest_sem:
+            r = _http.get(
+                f"{FAPI}/fapi/v1/ticker/24hr",
+                timeout=15
+            )
+
+        data = r.json()
+
+        if not isinstance(data, list):
+            print("⚠️ Invalid 24h ticker response")
+            return
+
+        now = time.time()
+        new_tracked = set()
+
+        for item in data:
+            symbol = item.get("symbol", "")
+
+            if not symbol.endswith("USDT"):
+                continue
+
+            try:
+                volume_24h = float(item.get("quoteVolume", 0) or 0)
+            except Exception:
+                continue
+
+            # ====================================================
+            # BULK 24h DATA → CACHE
+            # Eyni məlumatı sonradan ayrıca REST ilə istəməyək
+            # ====================================================
+            vol24_cache[symbol] = {
+                "ts": now,
+                "value": volume_24h
+            }
+
+            if volume_24h >= MIN24H:
+                new_tracked.add(symbol)
+
+        old_tracked = set(tracked_syms)
+        added = new_tracked - old_tracked
+        removed = old_tracked - new_tracked
+
+        # Yenidən tracking-ə daxil olan symbol-ların köhnə state-ni sıfırla
+        for symbol in added:
+            lock = state_locks[symbol]
+            with lock:
+                state.pop(symbol, None)
+            last_seen.pop(symbol, None)
+
+        tracked_syms = new_tracked
+
+        if added:
+            print(
+                f"🟢 NEW TRACKING ({len(added)}): "
+                f"{sorted(added)}"
+            )
+
+        if removed:
+            print(
+                f"🔴 REMOVED TRACKING ({len(removed)}): "
+                f"{sorted(removed)}"
+            )
+
+        print(
+            f"🔄 Dynamic volume refresh: "
+            f"{len(tracked_syms)} symbols >= ${MIN24H:,.0f}"
+        )
+
+    except Exception as e:
+        print("Dynamic volume refresh error:", e)
+
+def dynamic_volume_loop():
+    while True:
         try:
-            get_24h_volume_cached(s)
-        except Exception:
-            pass
+            refresh_tracked_symbols()
+        except Exception as e:
+            print("dynamic_volume_loop error:", e)
+
+        time.sleep(DYNAMIC_VOLUME_REFRESH)
 
 # ============================================================
 # TELEGRAM (async queue)
@@ -327,7 +401,7 @@ def _process_mini(msg):
     now = time.time()
     last_any_msg_ts = now
 
-    if tracked_syms and symbol not in tracked_syms:
+    if symbol not in tracked_syms:
         return
 
     price = float(msg.get("c", 0) or 0)
@@ -662,32 +736,28 @@ def start_stream():
 
     try:
         info = client.futures_exchange_info()
-        syms = [s["symbol"] for s in info["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
-        vol_list = [(s, get_24h_volume_cached(s)) for s in syms]
-        vol_list = [(s, v) for s, v in vol_list if v >= MIN24H]
 
-        vol_list.sort(key=lambda x: x[1], reverse=True)
-        top_syms = [s for s, v in vol_list[:TOP_N]]
+        syms = [
+            s["symbol"]
+            for s in info["symbols"]
+            if s["quoteAsset"] == "USDT"
+            and s["status"] == "TRADING"
+        ]
 
         print(f"✅ Found {len(syms)} USDT futures symbols.")
-        print(f"📌 After MIN24H filter: {len(top_syms)}")
-        print("🚀 TRACKING:", top_syms)
+
+        refresh_tracked_symbols()
+
+        if not tracked_syms:
+            print("⚠ No symbols to track! Increase MIN24H.")
+            return
+
+        print(f"📌 Initial MIN24H filter: {len(tracked_syms)}")
+        print("🚀 TRACKING:", sorted(tracked_syms))
 
     except Exception as e:
         print("Symbol load error:", e)
         return
-
-    if not top_syms:
-        print("⚠ No symbols to track! Increase MIN24H.")
-        return
-
-    tracked_syms = set(top_syms)
-
-    threading.Thread(
-        target=warmup_vol24,
-        args=(list(tracked_syms),),
-        daemon=True
-    ).start()
 
     try:
         twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
@@ -695,6 +765,11 @@ def start_stream():
         ws_manager = twm
 
         _start_miniticker_socket(twm)
+
+        threading.Thread(
+            target=dynamic_volume_loop,
+            daemon=True
+        ).start()
         
     except Exception as e:
         print("❌ Failed to start miniticker socket:", e)
