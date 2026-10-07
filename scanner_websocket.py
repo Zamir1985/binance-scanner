@@ -50,12 +50,12 @@ TELEGRAM_WORKERS = int(os.getenv("TELEGRAM_WORKERS", "1"))
 # CONFIG
 # ============================================================
 
-START_PCT = 5.0
-START_VOLUME_SPIKE = 3.0
-START_MIN_VOLUME_STRENGTH = 1.5
-FAKE_RECENT_MIN_USDT = 2000
-FAKE_RECENT_STRONG_USDT = 10000
-MIN24H = 2_000_000
+START_PCT = 2.0
+START_VOLUME_SPIKE = 2.0
+START_MIN_VOLUME_STRENGTH = 1.2
+FAKE_RECENT_MIN_USDT = 1000
+FAKE_RECENT_STRONG_USDT = 5000
+MIN24H = 1_000_000
 REENTRY_COOLDOWN = 180  # seconds (3 dəqiqə)
 
 TOP_N = 50
@@ -149,21 +149,6 @@ def get_24h_volume_cached(symbol):
     v = get_24h_volume(symbol)
     vol24_cache[symbol] = {"ts": now, "value": v}
     return v
-
-# ============================================================
-# VOL24 CACHE WARMUP (NON-WS)
-# ============================================================
-
-def warmup_vol24(symbols):
-    """
-    WS-dən kənarda 24h volume cache doldurur.
-    REST burda icazəlidir.
-    """
-    for s in symbols:
-        try:
-            get_24h_volume_cached(s)
-        except Exception:
-            pass
 
 # ============================================================
 # TELEGRAM (async queue)
@@ -361,7 +346,10 @@ def _process_mini(msg):
 
     last_seen[symbol] = now
 
-    prices = entry["prices"]
+    with lock:
+        prices = entry["prices"][:]
+        vols = entry["vols"][:]
+
     plen = len(prices)
 
     if plen <= LOOKBACK_MIN * 60:
@@ -372,15 +360,15 @@ def _process_mini(msg):
     price_15m_ago = prices[-LOOKBACK_MIN * 60]
     pct_15m = (price - price_15m_ago) / price_15m_ago * 100 if price_15m_ago else 0.0
 
-    recent_1m = sum(entry["vols"][-60:])
-    prev_5m = sum(entry["vols"][-360:-60]) or 1
+    recent_1m = sum(vols[-60:])
+    prev_5m = sum(vols[-360:-60]) or 1
     baseline_avg_1m = prev_5m / 5
     baseline_avg_1m = max(baseline_avg_1m, 10.0)  # min baseline clamp (USDT)
     vol_mult = recent_1m / baseline_avg_1m
 
     volume_strength = (
-        sum(entry["vols"][-900:]) /
-        max(sum(entry["vols"][-1800:-900]), 1)
+        sum(vols[-900:]) /
+        max(sum(vols[-1800:-900]), 1)
     )
 
     short_base = prices[-SHORT_WINDOW]
@@ -707,11 +695,11 @@ def start_stream():
 
     except Exception as e:
         print("Symbol load error:", e)
-        return
+        os._exit(1)
 
     if not top_syms:
         print("⚠ No symbols to track! Increase MIN24H.")
-        return
+        os._exit(1)
 
     tracked_syms = set(top_syms)
 
@@ -724,10 +712,11 @@ def start_stream():
         
     except Exception as e:
         print("❌ Failed to start miniticker socket:", e)
-        return
+        os._exit(1)
 
     threading.Thread(target=ws_monitor, daemon=True).start()
     print("🚀 Scanner started (WebSocket + Monitor)")
+    send_telegram("🚀 Scanner started")
 
 # ============================================================
 # MAIN
@@ -747,11 +736,6 @@ if __name__ == "__main__":
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=cleanup_loop, daemon=True).start()
-
-    try:
-        send_telegram("🚀 Scanner started")
-    except:
-        pass
 
     while True:
         time.sleep(5)
