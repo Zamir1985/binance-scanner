@@ -54,7 +54,6 @@ START_PCT = 5.0
 START_VOLUME_SPIKE = 3.0
 START_MIN_VOLUME_STRENGTH = 1.5
 
-FAKE_VOLUME_STRENGTH = 1.5
 FAKE_RECENT_MIN_USDT = 2000
 FAKE_RECENT_STRONG_USDT = 10000
 
@@ -395,10 +394,6 @@ def _process_mini(msg):
     # ========================================================
     # START — FULL POWER (ENQUEUE ONLY)
     # ========================================================
-    last_start_ts = entry.get("last_start_sent_ts", 0.0)
-    if now_ts - last_start_ts < REENTRY_COOLDOWN:
-        return
-    
     if (
         abs(pct_15m) >= START_PCT
         and vol_mult >= START_VOLUME_SPIKE
@@ -407,7 +402,6 @@ def _process_mini(msg):
         and volume_strength >= START_MIN_VOLUME_STRENGTH
         
         # --- FAKE SPIKE PROTECTION (RESTORED) ---
-        and volume_strength >= FAKE_VOLUME_STRENGTH
         and recent_1m >= FAKE_RECENT_MIN_USDT
         and (vol_mult <= 50 or recent_1m >= FAKE_RECENT_STRONG_USDT)
     ):
@@ -427,6 +421,11 @@ def _process_mini(msg):
         lock = state_locks[symbol]
 
         with lock:
+            last_start_ts = entry.get("last_start_sent_ts", 0.0)
+
+            if now_ts - last_start_ts < REENTRY_COOLDOWN:
+                return
+
             try:
                 task_queue.put_nowait(("START_FULL", snapshot))
             except Full:
