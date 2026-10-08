@@ -139,7 +139,7 @@ def log_signal(event_type, data: dict):
 def get_24h_volume(symbol):
     try:
         with rest_sem:
-            r = _http.get(f"{FAPI}/fapi/v1/ticker/24hr", params={"symbol": symbol}, timeout=8)
+            r = _http.get(f"{FAPI}/fapi/v1/ticker/24hr", params={"symbol": symbol}, timeout=2)
         return float(r.json().get("quoteVolume", 0))
     except Exception:
         return 0.0
