@@ -227,7 +227,11 @@ def telegram_worker():
                 pass
 
             # 2) Normal messages
-            text = telegram_queue.get()
+            try:
+                text = telegram_queue.get(timeout=0.5)
+            except Empty:
+                continue
+
             try:
                 _send_telegram_sync(text)
             finally:
