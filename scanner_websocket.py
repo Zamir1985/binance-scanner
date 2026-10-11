@@ -670,11 +670,12 @@ def start_stream():
     try:
         info = client.futures_exchange_info()
         syms = [s["symbol"] for s in info["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
+
         vol_list = [(s, get_24h_volume_cached(s)) for s in syms]
         vol_list = [(s, v) for s, v in vol_list if v >= MIN24H]
 
         vol_list.sort(key=lambda x: x[1], reverse=True)
-        top_syms = [s for s, v in vol_list[:TOP_N]]
+        top_syms = [s for s, v in vol_list]
 
         print(f"✅ Found {len(syms)} USDT futures symbols.")
         print(f"📌 After MIN24H filter: {len(top_syms)}")
