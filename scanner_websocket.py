@@ -61,7 +61,6 @@ MIN24H = 2_000_000
 
 REENTRY_COOLDOWN = 180  # seconds (3 dəqiqə)
 
-TOP_N = 50
 LOOKBACK_MIN = 15
 SHORT_WINDOW = 5
 VOL24_CACHE_TTL = 300
@@ -152,6 +151,33 @@ def get_24h_volume_cached(symbol):
     v = get_24h_volume(symbol)
     vol24_cache[symbol] = {"ts": now, "value": v}
     return v
+
+def refresh_vol24_cache():
+    try:
+        with rest_sem:
+            r = _http.get(
+                f"{FAPI}/fapi/v1/ticker/24hr",
+                timeout=10
+            )
+        r.raise_for_status()
+        data = r.json()
+        now = time.time()
+
+        for item in data:
+            symbol = item.get("symbol")
+            if symbol:
+                vol24_cache[symbol] = {
+                    "ts": now,
+                    "value": float(item.get("quoteVolume", 0) or 0)
+                }
+
+        print(f"📊 Bulk 24h volume cache updated: {len(data)} symbols")
+        return True
+
+    except Exception as e:
+        print("Bulk 24h volume error:", e)
+        return False
+
 
 # ============================================================
 # VOL24 CACHE WARMUP (NON-WS)
@@ -658,6 +684,50 @@ def cleanup_loop():
 
         time.sleep(600)  # 10 dəq
 
+
+def refresh_tracked_symbols():
+    global tracked_syms
+
+    while True:
+        time.sleep(300)  # 5 dəqiqə
+
+        try:
+            info = client.futures_exchange_info()
+            syms = [
+                s["symbol"] for s in info["symbols"]
+                if s["quoteAsset"] == "USDT"
+                and s["status"] == "TRADING"
+            ]
+
+            if not refresh_vol24_cache():
+                print("⚠️ Volume refresh failed; keeping previous tracked symbols.")
+                continue
+
+            vol_list = [
+                (s, get_24h_volume_cached(s))
+                for s in syms
+            ]
+            new_tracked_syms = {
+                s for s, v in vol_list if v >= MIN24H
+            }
+
+            if not new_tracked_syms:
+                print("⚠️ No qualifying symbols found. Tracked list will be empty.")
+
+            old_count = len(tracked_syms)
+            added = new_tracked_syms - tracked_syms
+            removed = tracked_syms - new_tracked_syms
+
+            tracked_syms = new_tracked_syms
+
+            print(
+                f"🔄 Symbols refreshed: {len(tracked_syms)} tracked, "
+                f"+{len(added)} added, -{len(removed)} removed."
+            )
+            
+        except Exception as e:
+            print("Symbol refresh error:", e)
+
 # ============================================================
 # START STREAM
 # ============================================================
@@ -670,6 +740,9 @@ def start_stream():
     try:
         info = client.futures_exchange_info()
         syms = [s["symbol"] for s in info["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
+        
+        
+        refresh_vol24_cache()
 
         vol_list = [(s, get_24h_volume_cached(s)) for s in syms]
         vol_list = [(s, v) for s, v in vol_list if v >= MIN24H]
@@ -725,7 +798,9 @@ if __name__ == "__main__":
     for _ in range(max(1, ANALYSIS_WORKERS)):
         threading.Thread(target=analysis_worker, daemon=True).start()
 
+
     threading.Thread(target=start_stream, daemon=True).start()
+    threading.Thread(target=refresh_tracked_symbols, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=cleanup_loop, daemon=True).start()
