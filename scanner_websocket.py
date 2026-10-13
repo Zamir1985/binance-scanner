@@ -32,15 +32,18 @@ telegram_overflow_warned = False
 # Uptime / monitor states
 START_TIME = time.time()
 last_any_msg_ts = 0.0
+last_kline_msg_ts = 0.0
 last_heartbeat_ts = 0.0
 
 # Websocket manager holder
 ws_manager = None
+volume_socket_count = 0
 
 # Task queues
 task_queue = Queue(maxsize=2000)                 # START heavy work
-telegram_priority_queue = Queue(maxsize=500)     # START messages
-telegram_queue = Queue(maxsize=2000)             # HEARTBEAT/WATCHDOG messages
+# Telegram queues are unbounded so alerts are not discarded just because a burst fills a queue.
+telegram_priority_queue = Queue()
+telegram_queue = Queue()
 
 # Workers config
 ANALYSIS_WORKERS = int(os.getenv("ANALYSIS_WORKERS", "4"))
@@ -52,12 +55,12 @@ TELEGRAM_WORKERS = int(os.getenv("TELEGRAM_WORKERS", "1"))
 
 START_PCT = 5.0
 START_VOLUME_SPIKE = 3.0
-START_MIN_VOLUME_STRENGTH = 2
+START_MIN_VOLUME_STRENGTH = 1.5
 
 FAKE_RECENT_MIN_USDT = 2000
 FAKE_RECENT_STRONG_USDT = 10000
 
-MIN24H = 3_000_000
+MIN24H = 2_000_000
 
 REENTRY_COOLDOWN = 180  # seconds (3 dəqiqə)
 
@@ -225,46 +228,54 @@ def _send_telegram_sync(text):
         return False
 
 def send_telegram(text, priority=False):
+    # Queueing succeeds independently of the eventual Telegram delivery.
     try:
-        if priority:
-            telegram_priority_queue.put_nowait(text)
-        else:
-            telegram_queue.put_nowait(text)
+        (telegram_priority_queue if priority else telegram_queue).put_nowait(text)
         return True
-    except Full:
-        global telegram_overflow_warned
-        if not telegram_overflow_warned:
-            telegram_overflow_warned = True
-            print("⚠️ Telegram queue overflow — messages dropped")
+    except Exception as e:
+        print("Telegram enqueue error:", e)
         return False
+
+
+def _send_telegram_with_retry(text, attempts=3):
+    for attempt in range(1, attempts + 1):
+        if _send_telegram_sync(text):
+            return True
+        if attempt < attempts:
+            delay = min(2 ** (attempt - 1), 8)
+            print(f"Telegram retry {attempt + 1}/{attempts} in {delay}s")
+            time.sleep(delay)
+    print("❌ Telegram delivery failed after retries")
+    return False
+
 
 def telegram_worker():
     while True:
+        queue_ref = None
         try:
-            # 1) Priority messages first (START)
+            # START messages have priority over routine heartbeat messages.
             try:
                 text = telegram_priority_queue.get_nowait()
+                queue_ref = telegram_priority_queue
+            except Empty:
                 try:
-                    _send_telegram_sync(text)
-                finally:
-                    telegram_priority_queue.task_done()
-                continue
-            except Empty:
-                pass
-
-            # 2) Normal messages
-            try:
-                text = telegram_queue.get(timeout=0.5)
-            except Empty:
-                continue
+                    text = telegram_queue.get(timeout=0.5)
+                    queue_ref = telegram_queue
+                except Empty:
+                    continue
 
             try:
-                _send_telegram_sync(text)
+                _send_telegram_with_retry(text)
             finally:
-                telegram_queue.task_done()
-
+                queue_ref.task_done()
+                queue_ref = None
         except Exception as e:
             print("telegram_worker error:", e)
+            if queue_ref is not None:
+                try:
+                    queue_ref.task_done()
+                except Exception:
+                    pass
 
 # ============================================================
 # START FULL (heavy) — moved off WS thread
@@ -351,6 +362,10 @@ def analysis_worker():
 # ============================================================
 
 def _process_mini(msg):
+    """
+    Price history comes from the miniTicker stream. Volume metrics are calculated
+    from actual 1-minute Futures kline quote-volume candles (see handle_kline).
+    """
     global last_any_msg_ts
 
     symbol = msg.get("s") or msg.get("symbol")
@@ -363,9 +378,10 @@ def _process_mini(msg):
     if tracked_syms and symbol not in tracked_syms:
         return
 
-    price = float(msg.get("c", 0) or 0)
-    vol = float(msg.get("q", 0) or 0)
-
+    try:
+        price = float(msg.get("c", 0) or 0)
+    except (TypeError, ValueError):
+        return
     if price <= 0:
         return
 
@@ -374,95 +390,89 @@ def _process_mini(msg):
         entry = state.setdefault(symbol, {
             "prices": [],
             "price_times": [],
-            "vols": [],
-            "last_v": None,
+            "candles": {},
             "tracking": False,
             "phase": "IDLE",
-        })  
-
+        })
 
         entry["prices"].append(price)
         entry["price_times"].append(now)
         entry["last_price"] = price
 
-        if entry["last_v"] is None:
-            diff_vol = 0.0
-        else:
-            diff_vol = max(vol - entry["last_v"], 0.0)
-        entry["last_v"] = vol
-        entry["vols"].append(diff_vol)
-      
-        entry["prices"] = entry["prices"][-1800:]
-        entry["price_times"] = entry["price_times"][-1800:]
-        entry["vols"] = entry["vols"][-1800:]
+        # Retain by elapsed time, not by number of websocket messages.
+        cutoff = now - 1800
+        first_valid = 0
+        while first_valid < len(entry["price_times"]) and entry["price_times"][first_valid] < cutoff:
+            first_valid += 1
+        if first_valid:
+            del entry["price_times"][:first_valid]
+            del entry["prices"][:first_valid]
+
+        # Take immutable local snapshots while still holding the symbol lock.
+        prices = list(entry["prices"])
+        price_times = list(entry["price_times"])
+        candles = dict(entry.get("candles", {}))
+        last_start_ts = entry.get("last_start_sent_ts", 0.0)
 
     last_seen[symbol] = now
-    
-    prices = entry["prices"]
-    plen = len(prices)
-
-    if plen <= SHORT_WINDOW:
+    if len(prices) <= SHORT_WINDOW:
         return
 
     target_ts = now - LOOKBACK_MIN * 60
-
-    price_times = entry["price_times"]
-
-    # Hədəf vaxtdan əvvəlki ən yaxın qiyməti tap
     idx = next(
-        (
-            i for i in range(len(price_times) - 1, -1, -1)
-            if price_times[i] <= target_ts
-        ),
-        None
+        (i for i in range(len(price_times) - 1, -1, -1) if price_times[i] <= target_ts),
+        None,
     )
-
-    # 15 dəqiqəlik tarixçə yoxdursa, hesablamanı dayandır
-    if idx is None:
-        return
-
-    # Seçilmiş qiymət çox köhnədirsə, yanlış müqayisə etmə
-    if target_ts - price_times[idx] > 30:
+    if idx is None or target_ts - price_times[idx] > 30:
         return
 
     price_15m_ago = prices[idx]
-
-    pct_15m = (
-        (price - price_15m_ago) / price_15m_ago * 100
-        if price_15m_ago else 0.0
-    )
-
-    recent_1m = sum(entry["vols"][-60:])
-    prev_5m = sum(entry["vols"][-360:-60]) or 1
-    baseline_avg_1m = prev_5m / 5
-    baseline_avg_1m = max(baseline_avg_1m, 10.0)  # min baseline clamp (USDT)
-    vol_mult = recent_1m / baseline_avg_1m
-
-    volume_strength = (
-        sum(entry["vols"][-900:]) /
-        max(sum(entry["vols"][-1800:-900]), 1)
-    )
-
+    pct_15m = (price - price_15m_ago) / price_15m_ago * 100 if price_15m_ago else 0.0
     short_base = prices[-SHORT_WINDOW]
     short_pct = (price - short_base) / short_base * 100 if short_base else 0.0
+
+    # Use actual Binance 1m candle quote volume, not rolling 24h miniTicker `q`.
+    minute_ms = int(now // 60) * 60_000
+    current_candle = candles.get(minute_ms)
+    if not current_candle or now - current_candle.get("updated_ts", 0) > 90:
+        return
+
+    candle_items = sorted(candles.items())
+    prior_closed = [
+        (open_ms, candle) for open_ms, candle in candle_items
+        if open_ms < minute_ms and candle.get("closed", False)
+    ]
+    prior_closed = prior_closed[-15:]
+    if len(prior_closed) < 15:
+        return
+
+    prev_5m = sum(float(candle.get("quote_volume", 0.0)) for _, candle in prior_closed[-5:])
+    baseline_avg_1m = max(prev_5m / 5.0, 10.0)
+    recent_1m = float(current_candle.get("quote_volume", 0.0))
+    vol_mult = recent_1m / baseline_avg_1m
+
+    latest_15 = [float(c.get("quote_volume", 0.0)) for _, c in prior_closed[-14:]] + [recent_1m]
+    earlier_15 = [
+        float(c.get("quote_volume", 0.0))
+        for open_ms, c in candle_items
+        if open_ms < prior_closed[0][0] and c.get("closed", False)
+    ][-15:]
+    if len(earlier_15) < 15:
+        return
+    volume_strength = sum(latest_15) / max(sum(earlier_15), 1.0)
 
     now_ts = now
 
     # ========================================================
-    # START — FULL POWER (ENQUEUE ONLY)
+    # START — FULL POWER (ENQUEUE ONLY); original thresholds preserved
     # ========================================================
     if (
         abs(pct_15m) >= START_PCT
         and vol_mult >= START_VOLUME_SPIKE
-        
-        # --- START PRE-FILTER (PRO GATE) ---
         and volume_strength >= START_MIN_VOLUME_STRENGTH
-        
-        # --- FAKE SPIKE PROTECTION (RESTORED) ---
         and recent_1m >= FAKE_RECENT_MIN_USDT
         and (vol_mult <= 50 or recent_1m >= FAKE_RECENT_STRONG_USDT)
     ):
-
         snapshot = {
             "symbol": symbol,
             "price": price,
@@ -472,57 +482,46 @@ def _process_mini(msg):
             "short_pct": short_pct,
             "now_ts": now_ts,
             "trigger_ts": now_ts,
-            "trigger_price": price
+            "trigger_price": price,
         }
 
-        lock = state_locks[symbol]
-
         with lock:
+            entry = state.get(symbol)
+            if not entry:
+                return
             last_start_ts = entry.get("last_start_sent_ts", 0.0)
-
             if now_ts - last_start_ts < REENTRY_COOLDOWN:
                 return
-
             try:
                 task_queue.put_nowait(("START_FULL", snapshot))
             except Full:
                 print("⚠️ task_queue full, START dropped:", symbol)
                 return
 
-            prev_prices = entry.get("prices", [])
-            prev_price_times = entry.get("price_times", [])
-            prev_vols = entry.get("vols", [])
-            prev_last_v = entry.get("last_v")
-
+            # Preserve histories and candle data across the signal-state reset.
+            prev_prices = list(entry.get("prices", []))
+            prev_price_times = list(entry.get("price_times", []))
+            prev_candles = dict(entry.get("candles", {}))
             entry.clear()
-
-            entry["prices"] = prev_prices[-1800:]
-            entry["price_times"] = prev_price_times[-1800:]
-            entry["vols"] = prev_vols[-1800:]
-            entry["last_v"] = prev_last_v
+            entry["prices"] = prev_prices
+            entry["price_times"] = prev_price_times
+            entry["candles"] = prev_candles
             entry["last_start_sent_ts"] = now_ts
-
-
             entry["phase"] = "PENDING_START"
             entry["pending_start_ts"] = now_ts
             entry["tracking"] = True
             entry["start_price"] = price
             entry["start_time"] = now_ts
+            entry["last_price"] = price
             entry["direction"] = "LONG" if pct_15m > 0 else "SHORT"
-        
-# ============================================================
-# HANDLE MINITICKER (unwrap 'data' if present)
-# ============================================================
+
 
 def handle_miniticker(msg):
     try:
         if msg is None:
             return
-
-        # Some python-binance versions wrap payload like: {"stream": "...", "data": [...]}
         if isinstance(msg, dict) and "data" in msg:
             msg = msg["data"]
-
         if isinstance(msg, list):
             for item in msg:
                 if isinstance(item, dict):
@@ -531,6 +530,71 @@ def handle_miniticker(msg):
             _process_mini(msg)
     except Exception as e:
         print("handle_miniticker error:", e)
+
+
+def handle_kline(msg):
+    """Capture live 1m futures candles and their real quote-asset volume."""
+    global last_kline_msg_ts
+    try:
+        if not isinstance(msg, dict):
+            return
+        payload = msg.get("data", msg)
+        if not isinstance(payload, dict):
+            return
+        k = payload.get("k")
+        if not isinstance(k, dict):
+            return
+        symbol = k.get("s") or payload.get("s")
+        if not symbol:
+            return
+        if tracked_syms and symbol not in tracked_syms:
+            return
+        open_ms = int(k.get("t", 0))
+        if open_ms <= 0:
+            return
+        quote_volume = float(k.get("q", 0) or 0)
+        closed = bool(k.get("x", False))
+        now = time.time()
+        last_kline_msg_ts = now
+
+        lock = state_locks[symbol]
+        with lock:
+            entry = state.setdefault(symbol, {
+                "prices": [], "price_times": [], "candles": {},
+                "tracking": False, "phase": "IDLE",
+            })
+            candles = entry.setdefault("candles", {})
+            candles[open_ms] = {
+                "quote_volume": quote_volume,
+                "closed": closed,
+                "updated_ts": now,
+            }
+            # Keep at most 35 minutes of candles, keyed by candle open time.
+            cutoff_ms = int(now * 1000) - 35 * 60_000
+            for old_ms in list(candles):
+                if old_ms < cutoff_ms:
+                    candles.pop(old_ms, None)
+    except Exception as e:
+        print("handle_kline error:", e)
+
+
+def _start_miniticker_socket(twm: ThreadedWebsocketManager):
+    twm.start_miniticker_socket(callback=handle_miniticker)
+    print("📡 Subscribed to FUTURES MINITICKER stream.")
+
+
+def _start_kline_sockets(twm: ThreadedWebsocketManager, symbols):
+    # Chunk stream subscriptions to keep each combined-stream URL manageable.
+    global volume_socket_count
+    streams = [f"{symbol.lower()}@kline_1m" for symbol in sorted(symbols)]
+    volume_socket_count = 0
+    chunk_size = 80
+    for offset in range(0, len(streams), chunk_size):
+        chunk = streams[offset:offset + chunk_size]
+        twm.start_futures_multiplex_socket(callback=handle_kline, streams=chunk)
+        volume_socket_count += 1
+    print(f"📊 Subscribed to 1m kline volume streams: {len(streams)} symbols / {volume_socket_count} sockets.")
+
 
 # ============================================================
 # WEBSOCKET MONITOR (FUTURES MULTIPLEX)
@@ -562,9 +626,12 @@ def ws_monitor(min_active=10, check_interval=30):
                 if last_seen.get(s, 0) > now - 90
             )
 
-            if active < min_req and now - START_TIME > 120:
+            kline_stale = (last_kline_msg_ts == 0 and now - START_TIME > 180) or (
+                last_kline_msg_ts > 0 and now - last_kline_msg_ts > 180
+            )
+            if (active < min_req or kline_stale) and now - START_TIME > 120:
                 print(
-                    f"⚠ WS monitor: {active}/{min_req} active — reconnecting WS"
+                    f"⚠ WS monitor: {active}/{min_req} active, kline_stale={kline_stale} — reconnecting WS"
                 )
 
                 try:
@@ -584,6 +651,7 @@ def ws_monitor(min_active=10, check_interval=30):
                     ws_manager = twm
 
                     _start_miniticker_socket(twm)
+                    _start_kline_sockets(twm, _all_usdt_symbols())
 
                     print("🔁 WebSocket reconnected")
 
@@ -632,13 +700,18 @@ def heartbeat_loop():
                 ws_status = "OK ✅" if ws_manager is not None else "NONE ⚠️"
                 tick_text = f"{int(last_msg_age)}s" if last_msg_age is not None else "N/A"
 
+                kline_age_text = (
+                    f"{int(now - last_kline_msg_ts)}s"
+                    if last_kline_msg_ts > 0 else "N/A"
+                )
                 hb_text = (
-                    "🤖 Scanner Alive (Railway)\n"
-                    f"Tracked pairs: {total}\n"
-                    f"Active (last 90s): {active}\n"
-                    f"Uptime: {format_uptime(uptime)}\n"
-                    f"WS: {ws_status}\n"
-                    f"Last tick age: {tick_text}"
+                    "🤖 Scanner Alive (Railway)\\n"
+                    f"Tracked pairs: {total}\\n"
+                    f"Active (last 90s): {active}\\n"
+                    f"Uptime: {format_uptime(uptime)}\\n"
+                    f"WS: {ws_status}\\n"
+                    f"Last tick age: {tick_text}\\n"
+                    f"Last 1m volume update: {kline_age_text}"
                 )
 
                 send_telegram(hb_text)
@@ -661,12 +734,9 @@ def watchdog_loop():
     while True:
         try:
             now = time.time()
-            if last_any_msg_ts == 0:
-                time.sleep(60)
-                continue
-
-            idle = now - last_any_msg_ts
             uptime = now - START_TIME
+            # If no first message ever arrived, measure inactivity from process start.
+            idle = now - (last_any_msg_ts if last_any_msg_ts > 0 else START_TIME)
 
             if idle > WATCHDOG_NO_MSG_TIMEOUT and uptime > WATCHDOG_MIN_UPTIME:
                 msg = (
@@ -757,6 +827,18 @@ def refresh_tracked_symbols():
             
         except Exception as e:
             print("Symbol refresh error:", e)
+
+def _all_usdt_symbols():
+    try:
+        info = client.futures_exchange_info()
+        return [
+            item["symbol"] for item in info.get("symbols", [])
+            if item.get("quoteAsset") == "USDT" and item.get("status") == "TRADING"
+        ]
+    except Exception as e:
+        print("Could not reload symbols for kline streams:", e)
+        return list(tracked_syms)
+
 
 # ============================================================
 # START STREAM
