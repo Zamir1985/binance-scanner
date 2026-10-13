@@ -38,6 +38,8 @@ last_heartbeat_ts = 0.0
 # Websocket manager holder
 ws_manager = None
 volume_socket_count = 0
+last_reconnect_attempt_ts = 0.0
+reconnect_lock = threading.Lock()
 
 # Task queues
 task_queue = Queue(maxsize=2000)                 # START heavy work
@@ -579,8 +581,12 @@ def handle_kline(msg):
 
 
 def _start_miniticker_socket(twm: ThreadedWebsocketManager):
-    twm.start_miniticker_socket(callback=handle_miniticker)
-    print("📡 Subscribed to FUTURES MINITICKER stream.")
+    # Use the USDⓈ-M Futures all-market miniTicker stream, not the spot miniTicker socket.
+    twm.start_futures_multiplex_socket(
+        callback=handle_miniticker,
+        streams=["!miniTicker@arr"],
+    )
+    print("📡 Subscribed to USDⓈ-M FUTURES !miniTicker@arr stream.")
 
 
 def _start_kline_sockets(twm: ThreadedWebsocketManager, symbols):
@@ -600,66 +606,62 @@ def _start_kline_sockets(twm: ThreadedWebsocketManager, symbols):
 # WEBSOCKET MONITOR (FUTURES MULTIPLEX)
 # ============================================================
 
-def _start_miniticker_socket(twm: ThreadedWebsocketManager):
-    twm.start_miniticker_socket(
-        callback=handle_miniticker
-    )
-
-    print("📡 Subscribed to FUTURES MINITICKER stream.")
-
-
 def ws_monitor(min_active=10, check_interval=30):
-    global ws_manager
+    global ws_manager, last_reconnect_attempt_ts
 
     while True:
         try:
             now = time.time()
-
             min_req = (
-                min(min_active, max(2, len(tracked_syms)//3))
-                if tracked_syms
-                else min_active
+                min(min_active, max(2, len(tracked_syms) // 3))
+                if tracked_syms else min_active
             )
-
             active = sum(
-                1 for s in tracked_syms
-                if last_seen.get(s, 0) > now - 90
+                1 for symbol in tracked_syms
+                if last_seen.get(symbol, 0) > now - 90
             )
-
-            kline_stale = (last_kline_msg_ts == 0 and now - START_TIME > 180) or (
-                last_kline_msg_ts > 0 and now - last_kline_msg_ts > 180
+            kline_stale = (
+                (last_kline_msg_ts == 0 and now - START_TIME > 180)
+                or (last_kline_msg_ts > 0 and now - last_kline_msg_ts > 180)
             )
-            if (active < min_req or kline_stale) and now - START_TIME > 120:
-                print(
-                    f"⚠ WS monitor: {active}/{min_req} active, kline_stale={kline_stale} — reconnecting WS"
-                )
+            needs_reconnect = (active < min_req or kline_stale) and now - START_TIME > 120
 
+            # A cooldown prevents the monitor from killing newly opened sockets every 30s.
+            if needs_reconnect and now - last_reconnect_attempt_ts >= 180:
+                if not reconnect_lock.acquire(blocking=False):
+                    time.sleep(check_interval)
+                    continue
                 try:
-                    if ws_manager:
-                        ws_manager.stop()
-                        time.sleep(2)
-                except:
-                    pass
-
-                try:
-                    twm = ThreadedWebsocketManager(
-                        api_key=BINANCE_API_KEY,
-                        api_secret=BINANCE_API_SECRET
+                    # Set before reconnecting so failures are also rate-limited.
+                    last_reconnect_attempt_ts = time.time()
+                    print(
+                        f"⚠ WS monitor: {active}/{min_req} active, "
+                        f"kline_stale={kline_stale} — reconnecting WS"
                     )
+                    try:
+                        old_manager = ws_manager
+                        if old_manager:
+                            old_manager.stop()
+                            time.sleep(2)
+                    except Exception as stop_error:
+                        print("WS stop warning:", stop_error)
 
-                    twm.start()
-                    ws_manager = twm
-
-                    _start_miniticker_socket(twm)
-                    _start_kline_sockets(twm, _all_usdt_symbols())
-
-                    print("🔁 WebSocket reconnected")
-
-                except Exception as e:
-                    print("WS reconnect failed:", e)
+                    try:
+                        twm = ThreadedWebsocketManager(
+                            api_key=BINANCE_API_KEY,
+                            api_secret=BINANCE_API_SECRET,
+                        )
+                        twm.start()
+                        ws_manager = twm
+                        _start_miniticker_socket(twm)
+                        _start_kline_sockets(twm, _all_usdt_symbols())
+                        print("🔁 WebSocket reconnected")
+                    except Exception as e:
+                        print("WS reconnect failed:", e)
+                finally:
+                    reconnect_lock.release()
 
             time.sleep(check_interval)
-
         except Exception as e:
             print("ws_monitor error:", e)
             time.sleep(check_interval)
@@ -705,12 +707,12 @@ def heartbeat_loop():
                     if last_kline_msg_ts > 0 else "N/A"
                 )
                 hb_text = (
-                    "🤖 Scanner Alive (Railway)\\n"
-                    f"Tracked pairs: {total}\\n"
-                    f"Active (last 90s): {active}\\n"
-                    f"Uptime: {format_uptime(uptime)}\\n"
-                    f"WS: {ws_status}\\n"
-                    f"Last tick age: {tick_text}\\n"
+                    "🤖 Scanner Alive (Railway)\n"
+                    f"Tracked pairs: {total}\n"
+                    f"Active (last 90s): {active}\n"
+                    f"Uptime: {format_uptime(uptime)}\n"
+                    f"WS: {ws_status}\n"
+                    f"Last tick age: {tick_text}\n"
                     f"Last 1m volume update: {kline_age_text}"
                 )
 
@@ -888,7 +890,8 @@ def start_stream():
         ws_manager = twm
 
         _start_miniticker_socket(twm)
-        
+        _start_kline_sockets(twm, _all_usdt_symbols())
+
     except Exception as e:
         print("❌ Failed to start miniticker socket:", e)
         return
