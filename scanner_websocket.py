@@ -40,6 +40,8 @@ ws_manager = None
 volume_socket_count = 0
 last_reconnect_attempt_ts = 0.0
 reconnect_lock = threading.Lock()
+first_miniticker_logged = False
+first_kline_logged = False
 
 # Task queues
 task_queue = Queue(maxsize=2000)                 # START heavy work
@@ -519,9 +521,18 @@ def _process_mini(msg):
 
 
 def handle_miniticker(msg):
+    global first_miniticker_logged
     try:
         if msg is None:
             return
+        if not first_miniticker_logged:
+            first_miniticker_logged = True
+            if isinstance(msg, dict):
+                raw_data = msg.get("data", msg)
+                count = len(raw_data) if isinstance(raw_data, list) else 1
+                print(f"🧪 First Futures miniTicker callback received: type=dict, payload_type={type(raw_data).__name__}, items={count}")
+            else:
+                print(f"🧪 First Futures miniTicker callback received: type={type(msg).__name__}")
         if isinstance(msg, dict) and "data" in msg:
             msg = msg["data"]
         if isinstance(msg, list):
@@ -536,7 +547,7 @@ def handle_miniticker(msg):
 
 def handle_kline(msg):
     """Capture live 1m futures candles and their real quote-asset volume."""
-    global last_kline_msg_ts
+    global last_kline_msg_ts, first_kline_logged
     try:
         if not isinstance(msg, dict):
             return
@@ -558,6 +569,9 @@ def handle_kline(msg):
         closed = bool(k.get("x", False))
         now = time.time()
         last_kline_msg_ts = now
+        if not first_kline_logged:
+            first_kline_logged = True
+            print(f"🧪 First Futures kline callback received: symbol={symbol}, interval={k.get('i', 'unknown')}, quote_volume={quote_volume:.2f}")
 
         lock = state_locks[symbol]
         with lock:
@@ -581,25 +595,30 @@ def handle_kline(msg):
 
 
 def _start_miniticker_socket(twm: ThreadedWebsocketManager):
-    # Use the USDⓈ-M Futures all-market miniTicker stream, not the spot miniTicker socket.
-    twm.start_futures_multiplex_socket(
-        callback=handle_miniticker,
-        streams=["!miniTicker@arr"],
-    )
-    print("📡 Subscribed to USDⓈ-M FUTURES !miniTicker@arr stream.")
+    # Subscribe to explicit USDⓈ-M Futures per-symbol streams. This avoids relying
+    # on the all-market array stream and keeps the callback payload predictable.
+    symbols = sorted(tracked_syms)
+    streams = [f"{symbol.lower()}@miniTicker" for symbol in symbols]
+    chunk_size = 80
+    socket_count = 0
+    for offset in range(0, len(streams), chunk_size):
+        chunk = streams[offset:offset + chunk_size]
+        twm.start_futures_multiplex_socket(callback=handle_miniticker, streams=chunk)
+        socket_count += 1
+    print(f"📡 Subscribed to USDⓈ-M FUTURES miniTicker streams: {len(streams)} symbols / {socket_count} sockets.")
 
 
 def _start_kline_sockets(twm: ThreadedWebsocketManager, symbols):
-    # Chunk stream subscriptions to keep each combined-stream URL manageable.
+    # Subscribe only to tracked pairs; this avoids unnecessary streams and load.
     global volume_socket_count
-    streams = [f"{symbol.lower()}@kline_1m" for symbol in sorted(symbols)]
+    streams = [f"{symbol.lower()}@kline_1m" for symbol in sorted(set(symbols) & tracked_syms)]
     volume_socket_count = 0
     chunk_size = 80
     for offset in range(0, len(streams), chunk_size):
         chunk = streams[offset:offset + chunk_size]
         twm.start_futures_multiplex_socket(callback=handle_kline, streams=chunk)
         volume_socket_count += 1
-    print(f"📊 Subscribed to 1m kline volume streams: {len(streams)} symbols / {volume_socket_count} sockets.")
+    print(f"📊 Subscribed to 1m kline volume streams: {len(streams)} tracked symbols / {volume_socket_count} sockets.")
 
 
 # ============================================================
@@ -654,7 +673,7 @@ def ws_monitor(min_active=10, check_interval=30):
                         twm.start()
                         ws_manager = twm
                         _start_miniticker_socket(twm)
-                        _start_kline_sockets(twm, _all_usdt_symbols())
+                        _start_kline_sockets(twm, list(tracked_syms))
                         print("🔁 WebSocket reconnected")
                     except Exception as e:
                         print("WS reconnect failed:", e)
@@ -890,7 +909,7 @@ def start_stream():
         ws_manager = twm
 
         _start_miniticker_socket(twm)
-        _start_kline_sockets(twm, _all_usdt_symbols())
+        _start_kline_sockets(twm, list(tracked_syms))
 
     except Exception as e:
         print("❌ Failed to start miniticker socket:", e)
