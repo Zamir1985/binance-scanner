@@ -198,48 +198,31 @@ def warmup_vol24(symbols):
 # TELEGRAM (async queue)
 # ============================================================
 
-def _send_telegram_sync(text, max_attempts=4):
+def _send_telegram_sync(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram secrets not set.")
         return False
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": escape_md(text),
-        "parse_mode": "MarkdownV2",
-    }
-    for attempt in range(1, max_attempts + 1):
-        try:
-            with rest_sem:
-                r = _http.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                    json=payload,
-                    timeout=10,
-                )
-            if r.ok:
-                try:
-                    body = r.json()
-                except ValueError:
-                    body = {}
-                if body.get("ok") is True:
-                    print(f"📩 Telegram sent (attempt {attempt})")
-                    return True
-                print("❌ Telegram API did not confirm success:", body)
-            else:
-                print("❌ Telegram failed:", r.status_code, r.text[:300])
-                # Respect Telegram's rate limit when it gives retry_after.
-                if r.status_code == 429:
-                    try:
-                        delay = float(r.json().get("parameters", {}).get("retry_after", 2))
-                    except Exception:
-                        delay = 2
-                    time.sleep(min(max(delay, 1), 30))
-        except Exception as e:
-            print(f"Telegram error (attempt {attempt}/{max_attempts}):", e)
-        if attempt < max_attempts:
-            time.sleep(min(2 ** (attempt - 1), 8))
-    print("🚨 Telegram delivery failed after retries")
-    return False
+    try:
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": escape_md(text),
+            "parse_mode": "MarkdownV2"
+        }
+        with rest_sem:
+            r = _http.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json=payload,
+                timeout=10
+            )
+        if r.ok:
+            print("📩 Telegram sent")
+            return True
+        else:
+            print("❌ Telegram failed:", r.status_code, r.text)
+            return False
+    except Exception as e:
+        print("Telegram error:", e)
+        return False
 
 def send_telegram(text, priority=False):
     try:
@@ -247,7 +230,6 @@ def send_telegram(text, priority=False):
             telegram_priority_queue.put_nowait(text)
         else:
             telegram_queue.put_nowait(text)
-        print("📥 Telegram message queued (not yet confirmed delivered)")
         return True
     except Full:
         global telegram_overflow_warned
@@ -305,10 +287,9 @@ def run_start_full(snapshot):
             f"{symbol}\n\n"
             f"📈 Change (15m): {pct_15m:+.2f}%\n"
             f"💰 Price: {snapshot.get('price', '-')}\n"
-            f"📊 Volume spike (current 1m / prior 5m avg): ×{vol_mult:.2f}\n"
-            f"💪 Volume Strength (last 15m / prior 15m): {volume_strength:.2f}x\n"
+            f"📊 Volume spike (1m/5m): ×{vol_mult:.2f}\n"
+            f"💪 Volume Strength (15m/15m): {volume_strength:.2f}x\n"
             f"⚡ Micro Spike (short): {short_pct:+.2f}%\n"
-            f"💵 Current 1m quote volume: {snapshot.get('recent_1m_usdt', 0):,.0f} USDT\n"
             f"📦 24h Volume: {vol24:,.0f} USDT\n"
         )
 
@@ -369,191 +350,187 @@ def analysis_worker():
 # WEBSOCKET CORE — REALTIME ENGINE (FAST)
 # ============================================================
 
-def _process_kline(msg):
-    """Process USD-M Futures 1m kline updates; q is current candle quote volume."""
+def _process_mini(msg):
     global last_any_msg_ts
-    if not isinstance(msg, dict):
-        return
-    if msg.get("e") == "error":
-        print("WebSocket stream error:", msg.get("m", msg))
+
+    symbol = msg.get("s") or msg.get("symbol")
+    if not symbol or not symbol.endswith("USDT"):
         return
 
-    k = msg.get("k")
-    symbol = msg.get("s") or (k.get("s") if isinstance(k, dict) else None)
-    if not symbol or not symbol.endswith("USDT") or not isinstance(k, dict):
-        return
+    now = time.time()
+    last_any_msg_ts = now
+
     if tracked_syms and symbol not in tracked_syms:
         return
 
-    try:
-        price = float(k.get("c", 0) or 0)
-        quote_volume = float(k.get("q", 0) or 0)
-        candle_start_ms = int(k.get("t"))
-        event_ms = int(msg.get("E") or int(time.time() * 1000))
-    except (TypeError, ValueError):
-        return
-    if price <= 0 or quote_volume < 0:
+    price = float(msg.get("c", 0) or 0)
+    vol = float(msg.get("q", 0) or 0)
+
+    if price <= 0:
         return
 
-    now = event_ms / 1000.0
-    last_any_msg_ts = time.time()
-    last_seen[symbol] = time.time()
     lock = state_locks[symbol]
-    trigger_snapshot = None
-
     with lock:
         entry = state.setdefault(symbol, {
             "prices": [],
             "price_times": [],
-            "volume_bars": {},       # candle_start_ms -> cumulative quote volume (USDT)
+            "vols": [],
+            "last_v": None,
             "tracking": False,
             "phase": "IDLE",
-            "last_price": price,
-            "last_kline_start_ms": candle_start_ms,
-        })
+        })  
+
 
         entry["prices"].append(price)
         entry["price_times"].append(now)
         entry["last_price"] = price
-        entry["last_kline_start_ms"] = candle_start_ms
 
-        # kline q is cumulative quote volume for this specific 1m candle.
-        # Store/replace it, rather than differencing the rolling 24h ticker volume.
-        bars = entry["volume_bars"]
-        bars[candle_start_ms] = quote_volume
-        cutoff_ms = candle_start_ms - 40 * 60 * 1000
-        for ts in list(bars.keys()):
-            if ts < cutoff_ms:
-                bars.pop(ts, None)
+        if entry["last_v"] is None:
+            diff_vol = 0.0
+        else:
+            diff_vol = max(vol - entry["last_v"], 0.0)
+        entry["last_v"] = vol
+        entry["vols"].append(diff_vol)
+      
+        entry["prices"] = entry["prices"][-1800:]
+        entry["price_times"] = entry["price_times"][-1800:]
+        entry["vols"] = entry["vols"][-1800:]
 
-        # Keep enough price points for the 15m lookup and short micro-change.
-        price_cutoff = now - 40 * 60
-        while entry["price_times"] and entry["price_times"][0] < price_cutoff:
-            entry["price_times"].pop(0)
-            entry["prices"].pop(0)
+    last_seen[symbol] = now
+    
+    prices = entry["prices"]
+    plen = len(prices)
 
-        prices = list(entry["prices"])
-        price_times = list(entry["price_times"])
-        bars_snapshot = dict(bars)
-        last_start_ts = float(entry.get("last_start_sent_ts", 0.0))
+    if plen <= SHORT_WINDOW:
+        return
 
-    # All calculations use immutable snapshots, outside the state lock.
     target_ts = now - LOOKBACK_MIN * 60
-    idx = next((i for i in range(len(price_times) - 1, -1, -1)
-                if price_times[i] <= target_ts), None)
-    if idx is None or target_ts - price_times[idx] > 90:
+
+    price_times = entry["price_times"]
+
+    # Hədəf vaxtdan əvvəlki ən yaxın qiyməti tap
+    idx = next(
+        (
+            i for i in range(len(price_times) - 1, -1, -1)
+            if price_times[i] <= target_ts
+        ),
+        None
+    )
+
+    # 15 dəqiqəlik tarixçə yoxdursa, hesablamanı dayandır
+    if idx is None:
+        return
+
+    # Seçilmiş qiymət çox köhnədirsə, yanlış müqayisə etmə
+    if target_ts - price_times[idx] > 30:
         return
 
     price_15m_ago = prices[idx]
-    pct_15m = ((price - price_15m_ago) / price_15m_ago * 100) if price_15m_ago else 0.0
-    # SHORT_WINDOW is interpreted as seconds, not a count of websocket messages.
-    short_target_ts = now - SHORT_WINDOW
-    short_idx = next((i for i in range(len(price_times) - 1, -1, -1)
-                      if price_times[i] <= short_target_ts), None)
-    if short_idx is None or short_target_ts - price_times[short_idx] > 10:
-        return
-    short_base = prices[short_idx]
-    short_pct = ((price - short_base) / short_base * 100) if short_base else 0.0
 
-    # Use real one-minute candle buckets. Require 30 minutes of observed data
-    # before calculating the volume ratios, avoiding misleading startup signals.
-    current_bar = candle_start_ms
-    previous_5 = [bars_snapshot.get(current_bar - i * 60_000)
-                  for i in range(1, 6)]
-    last_15 = [bars_snapshot.get(current_bar - i * 60_000)
-               for i in range(0, 15)]
-    prior_15 = [bars_snapshot.get(current_bar - i * 60_000)
-                for i in range(15, 30)]
-    if any(v is None for v in previous_5 + last_15 + prior_15):
-        return
+    pct_15m = (
+        (price - price_15m_ago) / price_15m_ago * 100
+        if price_15m_ago else 0.0
+    )
 
-    recent_1m = quote_volume
-    prev_5m = sum(previous_5)
-    baseline_avg_1m = max(prev_5m / 5.0, 10.0)
+    recent_1m = sum(entry["vols"][-60:])
+    prev_5m = sum(entry["vols"][-360:-60]) or 1
+    baseline_avg_1m = prev_5m / 5
+    baseline_avg_1m = max(baseline_avg_1m, 10.0)  # min baseline clamp (USDT)
     vol_mult = recent_1m / baseline_avg_1m
-    last_15m_volume = sum(last_15)
-    prior_15m_volume = sum(prior_15)
-    volume_strength = last_15m_volume / max(prior_15m_volume, 1.0)
 
-    if not (
+    volume_strength = (
+        sum(entry["vols"][-900:]) /
+        max(sum(entry["vols"][-1800:-900]), 1)
+    )
+
+    short_base = prices[-SHORT_WINDOW]
+    short_pct = (price - short_base) / short_base * 100 if short_base else 0.0
+
+    now_ts = now
+
+    # ========================================================
+    # START — FULL POWER (ENQUEUE ONLY)
+    # ========================================================
+    if (
         abs(pct_15m) >= START_PCT
         and vol_mult >= START_VOLUME_SPIKE
+        
+        # --- START PRE-FILTER (PRO GATE) ---
         and volume_strength >= START_MIN_VOLUME_STRENGTH
+        
+        # --- FAKE SPIKE PROTECTION (RESTORED) ---
         and recent_1m >= FAKE_RECENT_MIN_USDT
         and (vol_mult <= 50 or recent_1m >= FAKE_RECENT_STRONG_USDT)
     ):
-        return
 
-    now_ts = time.time()
-    if now_ts - last_start_ts < REENTRY_COOLDOWN:
-        return
+        snapshot = {
+            "symbol": symbol,
+            "price": price,
+            "pct_15m": pct_15m,
+            "vol_mult": vol_mult,
+            "volume_strength": volume_strength,
+            "short_pct": short_pct,
+            "now_ts": now_ts,
+            "trigger_ts": now_ts,
+            "trigger_price": price
+        }
 
-    snapshot = {
-        "symbol": symbol,
-        "price": price,
-        "pct_15m": pct_15m,
-        "vol_mult": vol_mult,
-        "volume_strength": volume_strength,
-        "short_pct": short_pct,
-        "recent_1m_usdt": recent_1m,
-        "now_ts": now_ts,
-        "trigger_ts": now_ts,
-        "trigger_price": price,
-    }
+        lock = state_locks[symbol]
 
-    with lock:
-        entry = state.get(symbol)
-        if not entry or entry.get("phase") == "PENDING_START":
-            return
-        last_start_ts = float(entry.get("last_start_sent_ts", 0.0))
-        if now_ts - last_start_ts < REENTRY_COOLDOWN:
-            return
-        try:
-            task_queue.put_nowait(("START_FULL", snapshot))
-        except Full:
-            print("⚠️ task_queue full, START dropped:", symbol)
-            return
-        entry["last_start_sent_ts"] = now_ts
-        entry["phase"] = "PENDING_START"
-        entry["pending_start_ts"] = now_ts
-        entry["tracking"] = True
-        entry["start_price"] = price
-        entry["start_time"] = now_ts
-        entry["direction"] = "LONG" if pct_15m > 0 else "SHORT"
+        with lock:
+            last_start_ts = entry.get("last_start_sent_ts", 0.0)
 
+            if now_ts - last_start_ts < REENTRY_COOLDOWN:
+                return
+
+            try:
+                task_queue.put_nowait(("START_FULL", snapshot))
+            except Full:
+                print("⚠️ task_queue full, START dropped:", symbol)
+                return
+
+            prev_prices = entry.get("prices", [])
+            prev_price_times = entry.get("price_times", [])
+            prev_vols = entry.get("vols", [])
+            prev_last_v = entry.get("last_v")
+
+            entry.clear()
+
+            entry["prices"] = prev_prices[-1800:]
+            entry["price_times"] = prev_price_times[-1800:]
+            entry["vols"] = prev_vols[-1800:]
+            entry["last_v"] = prev_last_v
+            entry["last_start_sent_ts"] = now_ts
+
+
+            entry["phase"] = "PENDING_START"
+            entry["pending_start_ts"] = now_ts
+            entry["tracking"] = True
+            entry["start_price"] = price
+            entry["start_time"] = now_ts
+            entry["direction"] = "LONG" if pct_15m > 0 else "SHORT"
+        
 # ============================================================
 # HANDLE MINITICKER (unwrap 'data' if present)
 # ============================================================
 
 def handle_miniticker(msg):
-    """Compatibility name retained; now handles Futures kline messages."""
     try:
         if msg is None:
             return
+
+        # Some python-binance versions wrap payload like: {"stream": "...", "data": [...]}
         if isinstance(msg, dict) and "data" in msg:
             msg = msg["data"]
+
         if isinstance(msg, list):
             for item in msg:
                 if isinstance(item, dict):
-                    _process_kline(item)
+                    _process_mini(item)
         elif isinstance(msg, dict):
-            _process_kline(msg)
+            _process_mini(msg)
     except Exception as e:
-        print("handle_kline error:", e)
-
-# ============================================================
-# WEBSOCKET STREAM HELPERS
-# ============================================================
-
-def _start_miniticker_socket(twm: ThreadedWebsocketManager, symbols=None):
-    """Subscribe to USD-M Futures 1m kline streams for the tracked symbols."""
-    symbols = sorted(symbols or tracked_syms)
-    if not symbols:
-        raise RuntimeError("No symbols available for Futures kline subscription")
-    streams = [f"{symbol.lower()}@kline_1m" for symbol in symbols]
-    # Futures multiplex streams are used explicitly; spot streams are not used.
-    twm.start_futures_multiplex_socket(callback=handle_miniticker, streams=streams)
-    print(f"📡 Subscribed to USD-M FUTURES 1m kline streams: {len(streams)} symbols")
+        print("handle_miniticker error:", e)
 
 # ============================================================
 # WEBSOCKET MONITOR (FUTURES MULTIPLEX)
@@ -568,32 +545,56 @@ def _start_miniticker_socket(twm: ThreadedWebsocketManager):
 
 
 def ws_monitor(min_active=10, check_interval=30):
-    """Supervisor: reconnect on stale stream or changed subscription list."""
     global ws_manager
+
     while True:
         try:
-            time.sleep(check_interval)
             now = time.time()
-            manager = ws_manager
-            if manager is None:
-                continue
-            last_msg = last_any_msg_ts
-            stale = (last_msg == 0 and now - START_TIME > 180) or (
-                last_msg > 0 and now - last_msg > 180
+
+            min_req = (
+                min(min_active, max(2, len(tracked_syms)//3))
+                if tracked_syms
+                else min_active
             )
-            subscribed = getattr(manager, "_scanner_symbols", set())
-            changed = set(tracked_syms) != set(subscribed)
-            if stale or changed:
-                reason = "stale/no incoming data" if stale else "tracked symbols changed"
-                print(f"⚠ WS supervisor: {reason}; restarting stream manager")
+
+            active = sum(
+                1 for s in tracked_syms
+                if last_seen.get(s, 0) > now - 90
+            )
+
+            if active < min_req and now - START_TIME > 120:
+                print(
+                    f"⚠ WS monitor: {active}/{min_req} active — reconnecting WS"
+                )
+
                 try:
-                    manager.stop()
+                    if ws_manager:
+                        ws_manager.stop()
+                        time.sleep(2)
+                except:
+                    pass
+
+                try:
+                    twm = ThreadedWebsocketManager(
+                        api_key=BINANCE_API_KEY,
+                        api_secret=BINANCE_API_SECRET
+                    )
+
+                    twm.start()
+                    ws_manager = twm
+
+                    _start_miniticker_socket(twm)
+
+                    print("🔁 WebSocket reconnected")
+
                 except Exception as e:
-                    print("WS stop warning:", e)
-                ws_manager = None
-                # start_stream supervisor owns reconnects; it notices ws_manager=None.
+                    print("WS reconnect failed:", e)
+
+            time.sleep(check_interval)
+
         except Exception as e:
             print("ws_monitor error:", e)
+            time.sleep(check_interval)
 
 # ============================================================
 # HEARTBEAT
@@ -628,7 +629,7 @@ def heartbeat_loop():
                 total = len(tracked_syms)
                 last_msg_age = now - last_any_msg_ts if last_any_msg_ts > 0 else None
 
-                ws_status = "CONNECTED/STARTED ⚠️" if ws_manager is not None else "RECONNECTING ⚠️"
+                ws_status = "OK ✅" if ws_manager is not None else "NONE ⚠️"
                 tick_text = f"{int(last_msg_age)}s" if last_msg_age is not None else "N/A"
 
                 hb_text = (
@@ -654,30 +655,35 @@ def heartbeat_loop():
 # ============================================================
 
 def watchdog_loop():
-    """Detect both never-connected and later-stalled websocket states."""
     if not WATCHDOG_ENABLED:
         return
+
     while True:
         try:
             now = time.time()
+            if last_any_msg_ts == 0:
+                time.sleep(60)
+                continue
+
+            idle = now - last_any_msg_ts
             uptime = now - START_TIME
-            last_msg = last_any_msg_ts
-            if uptime > WATCHDOG_MIN_UPTIME:
-                if last_msg == 0 and uptime > 180:
-                    reason = "no first Futures websocket message received"
-                elif last_msg > 0 and now - last_msg > WATCHDOG_NO_MSG_TIMEOUT:
-                    reason = f"no Futures websocket message for {int(now-last_msg)}s"
-                else:
-                    reason = None
-                if reason:
-                    msg = f"⚠ Watchdog: {reason}; exiting so Railway can restart the service."
-                    print(msg)
-                    # Best effort only; process exit must not wait indefinitely on Telegram.
-                    _send_telegram_sync(msg)
-                    os._exit(1)
+
+            if idle > WATCHDOG_NO_MSG_TIMEOUT and uptime > WATCHDOG_MIN_UPTIME:
+                msg = (
+                    f"⚠ Watchdog: no miniticker for {int(idle)}s, "
+                    f"uptime {format_uptime(uptime)} — restarting scanner (Railway will respawn)."
+                )
+                print(msg)
+                try:
+                    send_telegram(msg)
+                except:
+                    pass
+                os._exit(1)
+
         except Exception as e:
             print("watchdog_loop error:", e)
-        time.sleep(15)
+
+        time.sleep(60)
 
 def cleanup_loop():
     while True:
@@ -709,95 +715,104 @@ def cleanup_loop():
         time.sleep(600)  # 10 dəq
 
 
-def load_qualifying_symbols():
-    """Fetch currently trading USDT-M futures and filter by 24h quote volume."""
-    info = client.futures_exchange_info()
-    symbols = [
-        item["symbol"] for item in info.get("symbols", [])
-        if item.get("quoteAsset") == "USDT" and item.get("status") == "TRADING"
-    ]
-    if not refresh_vol24_cache():
-        raise RuntimeError("24h volume cache refresh failed")
-    qualifying = [(sym, get_24h_volume_cached(sym)) for sym in symbols]
-    qualifying = [(sym, vol) for sym, vol in qualifying if vol >= MIN24H]
-    qualifying.sort(key=lambda pair: pair[1], reverse=True)
-    return {sym for sym, _ in qualifying}, len(symbols)
-
-
 def refresh_tracked_symbols():
-    """Refresh the candidate list; the supervisor will resubscribe if it changes."""
     global tracked_syms
-    while True:
-        time.sleep(300)
-        try:
-            new_symbols, total = load_qualifying_symbols()
-            old = set(tracked_syms)
-            tracked_syms = new_symbols
-            print(
-                f"🔄 Symbols refreshed: {len(new_symbols)} tracked, "
-                f"+{len(new_symbols-old)} added, -{len(old-new_symbols)} removed "
-                f"(from {total} USDT Futures symbols)."
-            )
-        except Exception as e:
-            print("Symbol refresh error; keeping previous list:", e)
 
+    while True:
+        time.sleep(300)  # 5 dəqiqə
+
+        try:
+            info = client.futures_exchange_info()
+            syms = [
+                s["symbol"] for s in info["symbols"]
+                if s["quoteAsset"] == "USDT"
+                and s["status"] == "TRADING"
+            ]
+
+            if not refresh_vol24_cache():
+                print("⚠️ Volume refresh failed; keeping previous tracked symbols.")
+                continue
+
+            vol_list = [
+                (s, get_24h_volume_cached(s))
+                for s in syms
+            ]
+            new_tracked_syms = {
+                s for s, v in vol_list if v >= MIN24H
+            }
+
+            if not new_tracked_syms:
+                print("⚠️ No qualifying symbols found. Tracked list will be empty.")
+
+            old_count = len(tracked_syms)
+            added = new_tracked_syms - tracked_syms
+            removed = tracked_syms - new_tracked_syms
+
+            tracked_syms = new_tracked_syms
+
+            print(
+                f"🔄 Symbols refreshed: {len(tracked_syms)} tracked, "
+                f"+{len(added)} added, -{len(removed)} removed."
+            )
+            
+        except Exception as e:
+            print("Symbol refresh error:", e)
+
+# ============================================================
+# START STREAM
+# ============================================================
 
 def start_stream():
-    """Persistent WebSocket supervisor with bounded reconnect backoff."""
     global ws_manager, tracked_syms
-    retry_delay = 2
-    while True:
-        twm = None
-        try:
-            if not tracked_syms:
-                print("🔍 Loading symbols...")
-                symbols, total = load_qualifying_symbols()
-                if not symbols:
-                    raise RuntimeError("No symbols qualify for MIN24H filter")
-                tracked_syms = symbols
-                print(f"✅ Found {total} USDT Futures symbols; tracking {len(symbols)}")
-                print("🚀 TRACKING:", sorted(symbols))
 
-            subscribed = set(tracked_syms)
-            twm = ThreadedWebsocketManager(
-                api_key=BINANCE_API_KEY,
-                api_secret=BINANCE_API_SECRET,
-            )
-            twm.start()
-            _start_miniticker_socket(twm, subscribed)
-            twm._scanner_symbols = set(subscribed)
-            ws_manager = twm
-            retry_delay = 2
-            print("🚀 Scanner stream started (USD-M Futures kline_1m + supervisor)")
+    print("🔍 Loading symbols...")
 
-            # Stay here while healthy. Restart when symbols change or stream goes stale.
-            while True:
-                time.sleep(10)
-                if ws_manager is not twm:
-                    break
-                now = time.time()
-                last_msg = last_any_msg_ts
-                if last_msg == 0 and now - START_TIME > 180:
-                    raise RuntimeError("No initial websocket data within 180 seconds")
-                if last_msg > 0 and now - last_msg > 180:
-                    raise RuntimeError(f"WebSocket data stale for {int(now-last_msg)} seconds")
-                if set(tracked_syms) != subscribed:
-                    print("🔁 Tracked symbol set changed; rebuilding Futures subscriptions")
-                    break
+    try:
+        info = client.futures_exchange_info()
+        syms = [s["symbol"] for s in info["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
+        
+        
+        refresh_vol24_cache()
 
-        except Exception as e:
-            print("❌ WebSocket supervisor error:", e)
-        finally:
-            ws_manager = None
-            if twm is not None:
-                try:
-                    twm.stop()
-                except Exception as e:
-                    print("WebSocket stop warning:", e)
+        vol_list = [(s, get_24h_volume_cached(s)) for s in syms]
+        vol_list = [(s, v) for s, v in vol_list if v >= MIN24H]
 
-        print(f"🔄 Reconnecting WebSocket in {retry_delay}s...")
-        time.sleep(retry_delay)
-        retry_delay = min(retry_delay * 2, 60)
+        vol_list.sort(key=lambda x: x[1], reverse=True)
+        top_syms = [s for s, v in vol_list]
+
+        print(f"✅ Found {len(syms)} USDT futures symbols.")
+        print(f"📌 After MIN24H filter: {len(top_syms)}")
+        print("🚀 TRACKING:", top_syms)
+
+    except Exception as e:
+        print("Symbol load error:", e)
+        return
+
+    if not top_syms:
+        print("⚠ No symbols to track! Increase MIN24H.")
+        return
+
+    tracked_syms = set(top_syms)
+
+    threading.Thread(
+        target=warmup_vol24,
+        args=(list(tracked_syms),),
+        daemon=True
+    ).start()
+
+    try:
+        twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+        twm.start()
+        ws_manager = twm
+
+        _start_miniticker_socket(twm)
+        
+    except Exception as e:
+        print("❌ Failed to start miniticker socket:", e)
+        return
+
+    threading.Thread(target=ws_monitor, daemon=True).start()
+    print("🚀 Scanner started (WebSocket + Monitor)")
 
 # ============================================================
 # MAIN
@@ -816,7 +831,6 @@ if __name__ == "__main__":
 
     threading.Thread(target=start_stream, daemon=True).start()
     threading.Thread(target=refresh_tracked_symbols, daemon=True).start()
-    threading.Thread(target=ws_monitor, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=cleanup_loop, daemon=True).start()
