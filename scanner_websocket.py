@@ -52,7 +52,7 @@ TELEGRAM_WORKERS = int(os.getenv("TELEGRAM_WORKERS", "1"))
 
 START_PCT = 5.0
 START_VOLUME_SPIKE = 3.0
-START_MIN_VOLUME_STRENGTH = 1.8
+START_MIN_VOLUME_STRENGTH = 1.5
 
 FAKE_RECENT_MIN_USDT = 2000
 FAKE_RECENT_STRONG_USDT = 10000
@@ -373,16 +373,13 @@ def _process_mini(msg):
     with lock:
         entry = state.setdefault(symbol, {
             "prices": [],
-            "price_times": [],
             "vols": [],
             "last_v": None,
             "tracking": False,
-            "phase": "IDLE",
-        })  
-
+            "phase": "IDLE",            
+        })
 
         entry["prices"].append(price)
-        entry["price_times"].append(now)
         entry["last_price"] = price
 
         if entry["last_v"] is None:
@@ -391,46 +388,22 @@ def _process_mini(msg):
             diff_vol = max(vol - entry["last_v"], 0.0)
         entry["last_v"] = vol
         entry["vols"].append(diff_vol)
-      
+
         entry["prices"] = entry["prices"][-1800:]
-        entry["price_times"] = entry["price_times"][-1800:]
         entry["vols"] = entry["vols"][-1800:]
 
     last_seen[symbol] = now
-    
+
     prices = entry["prices"]
     plen = len(prices)
 
+    if plen <= LOOKBACK_MIN * 60:
+        return
     if plen <= SHORT_WINDOW:
         return
 
-    target_ts = now - LOOKBACK_MIN * 60
-
-    price_times = entry["price_times"]
-
-    # Hədəf vaxtdan əvvəlki ən yaxın qiyməti tap
-    idx = next(
-        (
-            i for i in range(len(price_times) - 1, -1, -1)
-            if price_times[i] <= target_ts
-        ),
-        None
-    )
-
-    # 15 dəqiqəlik tarixçə yoxdursa, hesablamanı dayandır
-    if idx is None:
-        return
-
-    # Seçilmiş qiymət çox köhnədirsə, yanlış müqayisə etmə
-    if target_ts - price_times[idx] > 30:
-        return
-
-    price_15m_ago = prices[idx]
-
-    pct_15m = (
-        (price - price_15m_ago) / price_15m_ago * 100
-        if price_15m_ago else 0.0
-    )
+    price_15m_ago = prices[-LOOKBACK_MIN * 60]
+    pct_15m = (price - price_15m_ago) / price_15m_ago * 100 if price_15m_ago else 0.0
 
     recent_1m = sum(entry["vols"][-60:])
     prev_5m = sum(entry["vols"][-360:-60]) or 1
@@ -490,18 +463,15 @@ def _process_mini(msg):
                 return
 
             prev_prices = entry.get("prices", [])
-            prev_price_times = entry.get("price_times", [])
             prev_vols = entry.get("vols", [])
             prev_last_v = entry.get("last_v")
 
             entry.clear()
 
             entry["prices"] = prev_prices[-1800:]
-            entry["price_times"] = prev_price_times[-1800:]
             entry["vols"] = prev_vols[-1800:]
             entry["last_v"] = prev_last_v
             entry["last_start_sent_ts"] = now_ts
-
 
             entry["phase"] = "PENDING_START"
             entry["pending_start_ts"] = now_ts
