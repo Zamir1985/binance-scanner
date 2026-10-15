@@ -3,8 +3,10 @@
 # ============================================================
 
 import os
+import sys
 import time
 import json
+import inspect
 import threading
 import requests
 from datetime import datetime
@@ -17,7 +19,7 @@ print = functools.partial(print, flush=True)
 
 from queue import Queue, Full, Empty
 
-from collections import defaultdict
+from collections import defaultdict, deque
 state_locks = defaultdict(threading.Lock)
 
 # ============================================================
@@ -27,11 +29,20 @@ state_locks = defaultdict(threading.Lock)
 state = {}             # per-symbol signal tracking
 last_seen = {}         # symbol timestamp monitor
 tracked_syms = set()
+aggtrade_subscribed_syms = set()
+aggtrade_socket_keys = []
+aggtrade_socket_manager = None
+aggtrade_symbol_socket = {}
+aggtrade_last_msg_by_socket = {}
+aggtrade_subscription_lock = threading.RLock()
+volume_epoch_ts_by_symbol = {}
 telegram_overflow_warned = False
 
 # Uptime / monitor states
 START_TIME = time.time()
 last_any_msg_ts = 0.0
+last_aggtrade_msg_ts = 0.0
+aggtrade_connected_ts = 0.0
 last_heartbeat_ts = 0.0
 
 # Websocket manager holder
@@ -62,7 +73,7 @@ MIN24H = 2_000_000
 REENTRY_COOLDOWN = 180  # seconds (3 dəqiqə)
 
 LOOKBACK_MIN = 15
-SHORT_WINDOW = 5
+SHORT_WINDOW_SECONDS = 5
 VOL24_CACHE_TTL = 300
 
 vol24_cache = {}
@@ -76,6 +87,9 @@ LOG_FILE = os.getenv("SIGNAL_LOG_FILE", "signals.log")
 WATCHDOG_ENABLED = True
 WATCHDOG_NO_MSG_TIMEOUT = int(os.getenv("WATCHDOG_NO_MSG_TIMEOUT", "1200"))
 WATCHDOG_MIN_UPTIME = 300
+AGGTRADE_IDLE_TIMEOUT = 180
+AGGTRADE_GROUP_IDLE_TIMEOUT = 300
+TELEGRAM_MAX_RETRIES = 3
 
 # ============================================================
 # API KEYS
@@ -201,7 +215,7 @@ def warmup_vol24(symbols):
 def _send_telegram_sync(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram secrets not set.")
-        return False
+        return False, None
     try:
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
@@ -214,22 +228,49 @@ def _send_telegram_sync(text):
                 json=payload,
                 timeout=10
             )
-        if r.ok:
+        try:
+            response_data = r.json()
+        except ValueError:
+            response_data = {}
+
+        if r.ok and response_data.get("ok") is True:
             print("📩 Telegram sent")
-            return True
+            return True, None
         else:
             print("❌ Telegram failed:", r.status_code, r.text)
-            return False
+            retry_after = None
+            if r.status_code == 429 or response_data.get("error_code") == 429:
+                parameters = response_data.get("parameters")
+                try:
+                    if isinstance(parameters, dict):
+                        retry_after = max(0.0, float(parameters.get("retry_after")))
+                except (TypeError, ValueError):
+                    retry_after = None
+            return False, retry_after
     except Exception as e:
         print("Telegram error:", e)
-        return False
+        return False, None
 
-def send_telegram(text, priority=False):
+
+def _send_telegram_with_retry(text):
+    for attempt in range(TELEGRAM_MAX_RETRIES):
+        delivered, retry_after = _send_telegram_sync(text)
+        if delivered:
+            return True
+        if attempt + 1 < TELEGRAM_MAX_RETRIES:
+            delay = retry_after if retry_after is not None else min(2 ** attempt, 8)
+            print(f"Telegram retry {attempt + 1}/{TELEGRAM_MAX_RETRIES - 1} in {delay}s")
+            time.sleep(delay)
+    print("❌ Telegram message failed after all retries")
+    return False
+
+def send_telegram(text, priority=False, on_result=None):
+    item = {"text": text, "on_result": on_result}
     try:
         if priority:
-            telegram_priority_queue.put_nowait(text)
+            telegram_priority_queue.put_nowait(item)
         else:
-            telegram_queue.put_nowait(text)
+            telegram_queue.put_nowait(item)
         return True
     except Full:
         global telegram_overflow_warned
@@ -238,37 +279,63 @@ def send_telegram(text, priority=False):
             print("⚠️ Telegram queue overflow — messages dropped")
         return False
 
+def _deliver_telegram_item(item):
+    if isinstance(item, dict):
+        text = item.get("text", "")
+        on_result = item.get("on_result")
+    else:
+        text = item
+        on_result = None
+    delivered = _send_telegram_with_retry(text)
+    if on_result:
+        on_result(delivered)
+
+
+def telegram_priority_worker():
+    while True:
+        try:
+            item = telegram_priority_queue.get()
+            try:
+                _deliver_telegram_item(item)
+            finally:
+                telegram_priority_queue.task_done()
+        except Exception as e:
+            print("telegram_priority_worker error:", e)
+
+
 def telegram_worker():
     while True:
         try:
-            # 1) Priority messages first (START)
+            item = telegram_queue.get()
             try:
-                text = telegram_priority_queue.get_nowait()
-                try:
-                    _send_telegram_sync(text)
-                finally:
-                    telegram_priority_queue.task_done()
-                continue
-            except Empty:
-                pass
-
-            # 2) Normal messages
-            try:
-                text = telegram_queue.get(timeout=0.5)
-            except Empty:
-                continue
-
-            try:
-                _send_telegram_sync(text)
+                _deliver_telegram_item(item)
             finally:
                 telegram_queue.task_done()
-
         except Exception as e:
             print("telegram_worker error:", e)
 
 # ============================================================
 # START FULL (heavy) — moved off WS thread
 # ============================================================
+
+def _finish_start_notification(symbol, snapshot, delivered):
+    lock = state_locks[symbol]
+    with lock:
+        entry = state.get(symbol)
+        if not entry or entry.get("phase") != "PENDING_START":
+            return
+
+        entry.pop("pending_start_ts", None)
+        entry["start_full_done_ts"] = time.time()
+        if delivered:
+            entry["phase"] = "ACTIVE"
+            entry["tracking"] = True
+            entry["start_time"] = snapshot.get("now_ts", time.time())
+            entry["start_price"] = snapshot.get("price", entry.get("last_price"))
+        else:
+            entry["phase"] = "IDLE"
+            entry["tracking"] = False
+            print(f"❌ START notification was not delivered; state reset to IDLE: {symbol}")
 
 def run_start_full(snapshot):
     symbol = snapshot["symbol"]
@@ -293,26 +360,21 @@ def run_start_full(snapshot):
             f"📦 24h Volume: {vol24:,.0f} USDT\n"
         )
 
-        send_telegram(caption, priority=True)
-
         log_signal("START", {
             "symbol": symbol,
             "pct_15m": pct_15m,
             "vol_mult": vol_mult,
             "direction": direction
         })
- 
-        lock = state_locks[symbol]
-        with lock:
-            e = state.get(symbol)
-            if e:
-                e["phase"] = "ACTIVE"
-                e.pop("pending_start_ts", None)
-                e["start_full_done_ts"] = time.time()
-
-                e["tracking"] = True
-                e["start_time"] = snapshot.get("now_ts", time.time())
-                e["start_price"] = snapshot.get("price", e.get("last_price"))
+        queued = send_telegram(
+            caption,
+            priority=True,
+            on_result=lambda delivered: _finish_start_notification(
+                symbol, snapshot, delivered
+            ),
+        )
+        if not queued:
+            _finish_start_notification(symbol, snapshot, False)
                 
     except Exception as e:
         print("run_start_full error:", e)
@@ -357,25 +419,23 @@ def _process_mini(msg):
     if not symbol or not symbol.endswith("USDT"):
         return
 
-    now = time.time()
-    last_any_msg_ts = now
-
-    if tracked_syms and symbol not in tracked_syms:
+    if not tracked_syms or symbol not in tracked_syms:
         return
 
+    now = time.time()
     price = float(msg.get("c", 0) or 0)
-    vol = float(msg.get("q", 0) or 0)
 
     if price <= 0:
         return
+
+    last_any_msg_ts = now
 
     lock = state_locks[symbol]
     with lock:
         entry = state.setdefault(symbol, {
             "prices": [],
             "price_times": [],
-            "vols": [],
-            "last_v": None,
+            "volume_buckets": deque(),
             "tracking": False,
             "phase": "IDLE",
         })  
@@ -385,28 +445,18 @@ def _process_mini(msg):
         entry["price_times"].append(now)
         entry["last_price"] = price
 
-        if entry["last_v"] is None:
-            diff_vol = 0.0
-        else:
-            diff_vol = max(vol - entry["last_v"], 0.0)
-        entry["last_v"] = vol
-        entry["vols"].append(diff_vol)
-      
-        entry["prices"] = entry["prices"][-1800:]
-        entry["price_times"] = entry["price_times"][-1800:]
-        entry["vols"] = entry["vols"][-1800:]
+        price_cutoff = now - 1800
+        while entry["price_times"] and entry["price_times"][0] < price_cutoff:
+            entry["price_times"].pop(0)
+            entry["prices"].pop(0)
+        prices = tuple(entry["prices"])
+        price_times = tuple(entry["price_times"])
+        volume_buckets = tuple(entry["volume_buckets"])
+        volume_epoch_ts = volume_epoch_ts_by_symbol.get(symbol, now)
 
     last_seen[symbol] = now
-    
-    prices = entry["prices"]
-    plen = len(prices)
-
-    if plen <= SHORT_WINDOW:
-        return
 
     target_ts = now - LOOKBACK_MIN * 60
-
-    price_times = entry["price_times"]
 
     # Hədəf vaxtdan əvvəlki ən yaxın qiyməti tap
     idx = next(
@@ -432,18 +482,40 @@ def _process_mini(msg):
         if price_15m_ago else 0.0
     )
 
-    recent_1m = sum(entry["vols"][-60:])
-    prev_5m = sum(entry["vols"][-360:-60]) or 1
+    # Require a complete 30-minute volume history for comparable 15m windows.
+    if (
+        not volume_buckets
+        or now - volume_epoch_ts < 1800
+        or now - volume_buckets[0][0] < 1800
+        or now - volume_buckets[-1][0] > 30
+    ):
+        return
+
+    def volume_between(start_ts, end_ts):
+        return sum(amount for ts, amount in volume_buckets if start_ts <= ts < end_ts)
+
+    recent_1m = volume_between(now - 60, now + 1)
+    prev_5m = volume_between(now - 360, now - 60)
     baseline_avg_1m = prev_5m / 5
     baseline_avg_1m = max(baseline_avg_1m, 10.0)  # min baseline clamp (USDT)
     vol_mult = recent_1m / baseline_avg_1m
 
-    volume_strength = (
-        sum(entry["vols"][-900:]) /
-        max(sum(entry["vols"][-1800:-900]), 1)
-    )
+    current_15m = volume_between(now - 900, now + 1)
+    previous_15m = volume_between(now - 1800, now - 900)
+    volume_strength = current_15m / max(previous_15m, 1)
 
-    short_base = prices[-SHORT_WINDOW]
+    short_target_ts = now - SHORT_WINDOW_SECONDS
+    short_idx = next(
+        (
+            i for i in range(len(price_times) - 1, -1, -1)
+            if price_times[i] <= short_target_ts
+        ),
+        None
+    )
+    if short_idx is None or now - price_times[short_idx] > 30:
+        return
+
+    short_base = prices[short_idx]
     short_pct = (price - short_base) / short_base * 100 if short_base else 0.0
 
     now_ts = now
@@ -478,6 +550,9 @@ def _process_mini(msg):
         lock = state_locks[symbol]
 
         with lock:
+            entry = state.get(symbol)
+            if entry is None:
+                return
             last_start_ts = entry.get("last_start_sent_ts", 0.0)
 
             if now_ts - last_start_ts < REENTRY_COOLDOWN:
@@ -491,15 +566,20 @@ def _process_mini(msg):
 
             prev_prices = entry.get("prices", [])
             prev_price_times = entry.get("price_times", [])
-            prev_vols = entry.get("vols", [])
-            prev_last_v = entry.get("last_v")
+            prev_volume_buckets = entry.get("volume_buckets", deque())
 
             entry.clear()
 
-            entry["prices"] = prev_prices[-1800:]
-            entry["price_times"] = prev_price_times[-1800:]
-            entry["vols"] = prev_vols[-1800:]
-            entry["last_v"] = prev_last_v
+            price_cutoff = now_ts - 1800
+            entry["prices"] = [
+                price for price, ts in zip(prev_prices, prev_price_times)
+                if ts >= price_cutoff
+            ]
+            entry["price_times"] = [
+                ts for ts in prev_price_times
+                if ts >= price_cutoff
+            ]
+            entry["volume_buckets"] = prev_volume_buckets
             entry["last_start_sent_ts"] = now_ts
 
 
@@ -510,6 +590,73 @@ def _process_mini(msg):
             entry["start_time"] = now_ts
             entry["direction"] = "LONG" if pct_15m > 0 else "SHORT"
         
+def _record_aggtrade(msg):
+    global last_aggtrade_msg_ts
+
+    symbol = msg.get("s")
+    if not symbol or not symbol.endswith("USDT"):
+        return
+    if not tracked_syms or symbol not in tracked_syms:
+        return
+    try:
+        price = float(msg.get("p", 0) or 0)
+        quantity = float(msg.get("q", 0) or 0)
+        event_ts = float(msg.get("T", msg.get("E", 0)) or 0) / 1000.0
+    except (TypeError, ValueError):
+        return
+    now = time.time()
+    if price <= 0 or quantity <= 0 or event_ts <= 0 or abs(now - event_ts) > 30:
+        return
+
+    quote_volume = price * quantity
+    second = int(event_ts)
+    lock = state_locks[symbol]
+    with lock:
+        entry = state.setdefault(symbol, {
+            "prices": [],
+            "price_times": [],
+            "volume_buckets": deque(),
+            "tracking": False,
+            "phase": "IDLE",
+        })
+        buckets = entry["volume_buckets"]
+        if buckets and second < buckets[-1][0]:
+            return
+        if buckets and buckets[-1][0] == second:
+            bucket_ts, amount = buckets[-1]
+            buckets[-1] = (bucket_ts, amount + quote_volume)
+        else:
+            buckets.append((second, quote_volume))
+        volume_epoch_ts_by_symbol.setdefault(
+            symbol, aggtrade_connected_ts or now
+        )
+        cutoff = event_ts - 1800
+        while buckets and buckets[0][0] < cutoff:
+            buckets.popleft()
+        last_aggtrade_msg_ts = now
+
+    with aggtrade_subscription_lock:
+        socket_key = aggtrade_symbol_socket.get(symbol)
+        if socket_key is not None:
+            aggtrade_last_msg_by_socket[socket_key] = now
+
+
+def handle_aggtrade(msg):
+    try:
+        if msg is None:
+            return
+        if isinstance(msg, dict) and "data" in msg:
+            msg = msg["data"]
+        if isinstance(msg, list):
+            for item in msg:
+                if isinstance(item, dict):
+                    _record_aggtrade(item)
+        elif isinstance(msg, dict):
+            _record_aggtrade(msg)
+    except Exception as e:
+        print("handle_aggtrade error:", e)
+
+
 # ============================================================
 # HANDLE MINITICKER (unwrap 'data' if present)
 # ============================================================
@@ -536,12 +683,86 @@ def handle_miniticker(msg):
 # WEBSOCKET MONITOR (FUTURES MULTIPLEX)
 # ============================================================
 
-def _start_miniticker_socket(twm: ThreadedWebsocketManager):
-    twm.start_miniticker_socket(
-        callback=handle_miniticker
-    )
+def _start_aggtrade_sockets(twm: ThreadedWebsocketManager, symbols):
+    global aggtrade_subscribed_syms, aggtrade_socket_keys, aggtrade_socket_manager
+    global aggtrade_symbol_socket, aggtrade_last_msg_by_socket
+    global last_aggtrade_msg_ts, aggtrade_connected_ts
 
-    print("📡 Subscribed to FUTURES MINITICKER stream.")
+    with aggtrade_subscription_lock:
+        if twm is not ws_manager:
+            return 0
+
+        if aggtrade_socket_manager is not twm:
+            aggtrade_socket_keys = []
+            aggtrade_subscribed_syms = set()
+            aggtrade_symbol_socket = {}
+            aggtrade_last_msg_by_socket = {}
+            aggtrade_socket_manager = twm
+
+        desired_symbols = set(symbols)
+        if desired_symbols == aggtrade_subscribed_syms:
+            return len(desired_symbols)
+
+        for socket_key in aggtrade_socket_keys:
+            twm.stop_socket(socket_key)
+        aggtrade_socket_keys = []
+        aggtrade_subscribed_syms = set()
+        aggtrade_symbol_socket = {}
+        aggtrade_last_msg_by_socket = {}
+        last_aggtrade_msg_ts = 0.0
+        aggtrade_connected_ts = time.time()
+        connection_epoch_ts = aggtrade_connected_ts
+        for symbol in desired_symbols:
+            with state_locks[symbol]:
+                volume_epoch_ts_by_symbol[symbol] = connection_epoch_ts
+
+        streams = [f"{symbol.lower()}@aggTrade" for symbol in sorted(desired_symbols)]
+        for offset in range(0, len(streams), 150):
+            stream_chunk = streams[offset:offset + 150]
+            socket_key = twm.start_futures_multiplex_socket(
+                callback=handle_aggtrade,
+                streams=stream_chunk,
+            )
+            if not socket_key:
+                raise RuntimeError("aggTrade WebSocket could not be started")
+            aggtrade_socket_keys.append(socket_key)
+            chunk_symbols = {
+                stream.rsplit("@", 1)[0].upper() for stream in stream_chunk
+            }
+            aggtrade_last_msg_by_socket[socket_key] = time.time()
+            for symbol in chunk_symbols:
+                aggtrade_symbol_socket[symbol] = socket_key
+            aggtrade_subscribed_syms.update(chunk_symbols)
+        return len(desired_symbols)
+
+
+def _start_miniticker_socket(twm: ThreadedWebsocketManager):
+    # aggTrade and miniTicker use the USDⓈ-M market route. Older
+    # python-binance releases do not expose the route argument.
+    bsm = getattr(twm, "_bsm", None)
+    route_wait_until = time.time() + 5
+    while bsm is None and time.time() < route_wait_until:
+        time.sleep(0.1)
+        bsm = getattr(twm, "_bsm", None)
+    if bsm is not None and hasattr(bsm, "futures_multiplex_socket"):
+        try:
+            params = inspect.signature(bsm.futures_multiplex_socket).parameters
+            if "category" not in params and hasattr(bsm, "FSTREAM_URL"):
+                base = bsm.FSTREAM_URL.rstrip("/")
+                bsm.FSTREAM_URL = (base if base.endswith("/market") else base + "/market") + "/"
+                print("🔧 Using USDⓈ-M /market WebSocket route")
+        except (TypeError, ValueError, AttributeError) as e:
+            print("⚠ Could not inspect WebSocket route:", e)
+
+    price_socket_key = twm.start_futures_multiplex_socket(
+        callback=handle_miniticker,
+        streams=["!miniTicker@arr"],
+    )
+    if not price_socket_key:
+        raise RuntimeError("Futures miniTicker WebSocket could not be started")
+
+    stream_count = _start_aggtrade_sockets(twm, tracked_syms)
+    print(f"📡 Subscribed to FUTURES MINITICKER and {stream_count} aggTrade streams.")
 
 
 def ws_monitor(min_active=10, check_interval=30):
@@ -552,7 +773,7 @@ def ws_monitor(min_active=10, check_interval=30):
             now = time.time()
 
             min_req = (
-                min(min_active, max(2, len(tracked_syms)//3))
+                min(min_active, max(1, len(tracked_syms)//3))
                 if tracked_syms
                 else min_active
             )
@@ -562,9 +783,44 @@ def ws_monitor(min_active=10, check_interval=30):
                 if last_seen.get(s, 0) > now - 90
             )
 
-            if active < min_req and now - START_TIME > 120:
+            aggtrade_reference_ts = last_aggtrade_msg_ts or aggtrade_connected_ts
+            aggtrade_stale = (
+                bool(tracked_syms)
+                and aggtrade_reference_ts > 0
+                and now - aggtrade_reference_ts > AGGTRADE_IDLE_TIMEOUT
+            )
+            with aggtrade_subscription_lock:
+                aggtrade_subscription_incomplete = (
+                    bool(tracked_syms)
+                    and aggtrade_subscribed_syms != tracked_syms
+                )
+                stale_aggtrade_sockets = [
+                    (socket_key, now - aggtrade_last_msg_by_socket.get(
+                        socket_key, aggtrade_connected_ts
+                    ))
+                    for socket_key in aggtrade_socket_keys
+                    if now - aggtrade_last_msg_by_socket.get(
+                        socket_key, aggtrade_connected_ts
+                    ) > AGGTRADE_GROUP_IDLE_TIMEOUT
+                ]
+            ws_started_ts = aggtrade_connected_ts or START_TIME
+
+            if (
+                tracked_syms
+                and (
+                    active < min_req
+                    or aggtrade_stale
+                    or stale_aggtrade_sockets
+                    or aggtrade_subscription_incomplete
+                )
+                and now - ws_started_ts > 120
+            ):
                 print(
-                    f"⚠ WS monitor: {active}/{min_req} active — reconnecting WS"
+                    f"⚠ WS monitor: {active}/{min_req} price-active, "
+                    f"aggTrade stale={aggtrade_stale}, "
+                    f"stale aggTrade groups={len(stale_aggtrade_sockets)}, "
+                    f"subscription complete={not aggtrade_subscription_incomplete} "
+                    f"— reconnecting WS"
                 )
 
                 try:
@@ -629,7 +885,15 @@ def heartbeat_loop():
                 total = len(tracked_syms)
                 last_msg_age = now - last_any_msg_ts if last_any_msg_ts > 0 else None
 
-                ws_status = "OK ✅" if ws_manager is not None else "NONE ⚠️"
+                aggtrade_reference_ts = last_aggtrade_msg_ts or aggtrade_connected_ts
+                ws_healthy = (
+                    ws_manager is not None
+                    and last_any_msg_ts > 0
+                    and now - last_any_msg_ts <= 90
+                    and aggtrade_reference_ts > 0
+                    and now - aggtrade_reference_ts <= AGGTRADE_IDLE_TIMEOUT
+                )
+                ws_status = "OK ✅" if ws_healthy else "STALE ⚠️"
                 tick_text = f"{int(last_msg_age)}s" if last_msg_age is not None else "N/A"
 
                 hb_text = (
@@ -662,6 +926,16 @@ def watchdog_loop():
         try:
             now = time.time()
             if last_any_msg_ts == 0:
+                idle = now - START_TIME
+                uptime = idle
+                if idle > WATCHDOG_NO_MSG_TIMEOUT and uptime > WATCHDOG_MIN_UPTIME:
+                    msg = (
+                        f"⚠ Watchdog: no tracked miniTicker received since startup, "
+                        f"uptime {format_uptime(uptime)} — restarting scanner (Railway will respawn)."
+                    )
+                    print(msg)
+                    _send_telegram_sync(msg)
+                    restart_scanner()
                 time.sleep(60)
                 continue
 
@@ -675,15 +949,25 @@ def watchdog_loop():
                 )
                 print(msg)
                 try:
-                    send_telegram(msg)
+                    _send_telegram_sync(msg)
                 except:
                     pass
-                os._exit(1)
+                restart_scanner()
 
         except Exception as e:
             print("watchdog_loop error:", e)
 
         time.sleep(60)
+
+
+def restart_scanner():
+    """Re-exec this process so recovery does not depend only on Railway policy."""
+    try:
+        print("🔁 Re-executing scanner process")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        print("Scanner self-restart failed; exiting for platform restart:", e)
+        os._exit(1)
 
 def cleanup_loop():
     while True:
@@ -727,6 +1011,8 @@ def refresh_tracked_symbols():
                 s["symbol"] for s in info["symbols"]
                 if s["quoteAsset"] == "USDT"
                 and s["status"] == "TRADING"
+                and s.get("contractType") == "PERPETUAL"
+                and s["symbol"].endswith("USDT")
             ]
 
             if not refresh_vol24_cache():
@@ -748,7 +1034,20 @@ def refresh_tracked_symbols():
             added = new_tracked_syms - tracked_syms
             removed = tracked_syms - new_tracked_syms
 
+            for symbol in removed | added:
+                with state_locks[symbol]:
+                    volume_epoch_ts_by_symbol.pop(symbol, None)
+                    entry = state.get(symbol)
+                    if entry is not None:
+                        entry["volume_buckets"] = deque()
+
             tracked_syms = new_tracked_syms
+
+            if ws_manager is not None and aggtrade_subscribed_syms != new_tracked_syms:
+                try:
+                    _start_aggtrade_sockets(ws_manager, new_tracked_syms)
+                except Exception as e:
+                    print("aggTrade subscription update failed:", e)
 
             print(
                 f"🔄 Symbols refreshed: {len(tracked_syms)} tracked, "
@@ -765,54 +1064,62 @@ def refresh_tracked_symbols():
 def start_stream():
     global ws_manager, tracked_syms
 
-    print("🔍 Loading symbols...")
+    while True:
+        twm = None
+        try:
+            print("🔍 Loading symbols...")
+            info = client.futures_exchange_info()
+            syms = [
+                item["symbol"] for item in info["symbols"]
+                if item.get("quoteAsset") == "USDT"
+                and item.get("status") == "TRADING"
+                and item.get("contractType") == "PERPETUAL"
+                and item["symbol"].endswith("USDT")
+            ]
 
-    try:
-        info = client.futures_exchange_info()
-        syms = [s["symbol"] for s in info["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
-        
-        
-        refresh_vol24_cache()
+            if not refresh_vol24_cache():
+                raise RuntimeError("Binance 24h volume refresh failed during startup")
 
-        vol_list = [(s, get_24h_volume_cached(s)) for s in syms]
-        vol_list = [(s, v) for s, v in vol_list if v >= MIN24H]
+            vol_list = [(symbol, get_24h_volume_cached(symbol)) for symbol in syms]
+            vol_list = [(symbol, volume) for symbol, volume in vol_list if volume >= MIN24H]
+            vol_list.sort(key=lambda item: item[1], reverse=True)
+            top_syms = [symbol for symbol, _ in vol_list]
 
-        vol_list.sort(key=lambda x: x[1], reverse=True)
-        top_syms = [s for s, v in vol_list]
+            print(f"✅ Found {len(syms)} USDT perpetual futures symbols.")
+            print(f"📌 After MIN24H filter: {len(top_syms)}")
+            print("🚀 TRACKING:", top_syms)
 
-        print(f"✅ Found {len(syms)} USDT futures symbols.")
-        print(f"📌 After MIN24H filter: {len(top_syms)}")
-        print("🚀 TRACKING:", top_syms)
+            if not top_syms:
+                raise RuntimeError("No USDT perpetual symbols meet MIN24H")
 
-    except Exception as e:
-        print("Symbol load error:", e)
-        return
+            tracked_syms = set(top_syms)
+            twm = ThreadedWebsocketManager(
+                api_key=BINANCE_API_KEY,
+                api_secret=BINANCE_API_SECRET
+            )
+            twm.start()
+            ws_manager = twm
+            _start_miniticker_socket(twm)
 
-    if not top_syms:
-        print("⚠ No symbols to track! Increase MIN24H.")
-        return
+            threading.Thread(
+                target=warmup_vol24,
+                args=(list(tracked_syms),),
+                daemon=True
+            ).start()
+            threading.Thread(target=ws_monitor, daemon=True).start()
+            print("🚀 Scanner started (WebSocket + Monitor)")
+            return
 
-    tracked_syms = set(top_syms)
-
-    threading.Thread(
-        target=warmup_vol24,
-        args=(list(tracked_syms),),
-        daemon=True
-    ).start()
-
-    try:
-        twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
-        twm.start()
-        ws_manager = twm
-
-        _start_miniticker_socket(twm)
-        
-    except Exception as e:
-        print("❌ Failed to start miniticker socket:", e)
-        return
-
-    threading.Thread(target=ws_monitor, daemon=True).start()
-    print("🚀 Scanner started (WebSocket + Monitor)")
+        except Exception as e:
+            print("❌ Scanner startup failed; retrying in 30s:", e)
+            if twm is not None:
+                try:
+                    twm.stop()
+                except Exception as stop_error:
+                    print("WebSocket cleanup after startup failure:", stop_error)
+            if ws_manager is twm:
+                ws_manager = None
+            time.sleep(30)
 
 # ============================================================
 # MAIN
@@ -822,6 +1129,8 @@ if __name__ == "__main__":
     print("🚀 SCANNER STARTING (SCANNER PRO)")
 
     # Start workers FIRST
+    threading.Thread(target=telegram_priority_worker, daemon=True).start()
+
     for _ in range(max(1, TELEGRAM_WORKERS)):
         threading.Thread(target=telegram_worker, daemon=True).start()
 
