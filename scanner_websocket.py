@@ -61,7 +61,6 @@ MIN24H = 2_000_000
 
 REENTRY_COOLDOWN = 180  # seconds (3 dəqiqə)
 
-TOP_N = 50
 LOOKBACK_MIN = 15
 SHORT_WINDOW = 5
 VOL24_CACHE_TTL = 300
@@ -152,6 +151,33 @@ def get_24h_volume_cached(symbol):
     v = get_24h_volume(symbol)
     vol24_cache[symbol] = {"ts": now, "value": v}
     return v
+
+def refresh_vol24_cache():
+    try:
+        with rest_sem:
+            r = _http.get(
+                f"{FAPI}/fapi/v1/ticker/24hr",
+                timeout=10
+            )
+        r.raise_for_status()
+        data = r.json()
+        now = time.time()
+
+        for item in data:
+            symbol = item.get("symbol")
+            if symbol:
+                vol24_cache[symbol] = {
+                    "ts": now,
+                    "value": float(item.get("quoteVolume", 0) or 0)
+                }
+
+        print(f"📊 Bulk 24h volume cache updated: {len(data)} symbols")
+        return True
+
+    except Exception as e:
+        print("Bulk 24h volume error:", e)
+        return False
+
 
 # ============================================================
 # VOL24 CACHE WARMUP (NON-WS)
@@ -347,13 +373,16 @@ def _process_mini(msg):
     with lock:
         entry = state.setdefault(symbol, {
             "prices": [],
+            "price_times": [],
             "vols": [],
             "last_v": None,
             "tracking": False,
-            "phase": "IDLE",            
-        })
+            "phase": "IDLE",
+        })  
+
 
         entry["prices"].append(price)
+        entry["price_times"].append(now)
         entry["last_price"] = price
 
         if entry["last_v"] is None:
@@ -362,22 +391,46 @@ def _process_mini(msg):
             diff_vol = max(vol - entry["last_v"], 0.0)
         entry["last_v"] = vol
         entry["vols"].append(diff_vol)
-
+      
         entry["prices"] = entry["prices"][-1800:]
+        entry["price_times"] = entry["price_times"][-1800:]
         entry["vols"] = entry["vols"][-1800:]
 
     last_seen[symbol] = now
-
+    
     prices = entry["prices"]
     plen = len(prices)
 
-    if plen <= LOOKBACK_MIN * 60:
-        return
     if plen <= SHORT_WINDOW:
         return
 
-    price_15m_ago = prices[-LOOKBACK_MIN * 60]
-    pct_15m = (price - price_15m_ago) / price_15m_ago * 100 if price_15m_ago else 0.0
+    target_ts = now - LOOKBACK_MIN * 60
+
+    price_times = entry["price_times"]
+
+    # Hədəf vaxtdan əvvəlki ən yaxın qiyməti tap
+    idx = next(
+        (
+            i for i in range(len(price_times) - 1, -1, -1)
+            if price_times[i] <= target_ts
+        ),
+        None
+    )
+
+    # 15 dəqiqəlik tarixçə yoxdursa, hesablamanı dayandır
+    if idx is None:
+        return
+
+    # Seçilmiş qiymət çox köhnədirsə, yanlış müqayisə etmə
+    if target_ts - price_times[idx] > 30:
+        return
+
+    price_15m_ago = prices[idx]
+
+    pct_15m = (
+        (price - price_15m_ago) / price_15m_ago * 100
+        if price_15m_ago else 0.0
+    )
 
     recent_1m = sum(entry["vols"][-60:])
     prev_5m = sum(entry["vols"][-360:-60]) or 1
@@ -437,15 +490,18 @@ def _process_mini(msg):
                 return
 
             prev_prices = entry.get("prices", [])
+            prev_price_times = entry.get("price_times", [])
             prev_vols = entry.get("vols", [])
             prev_last_v = entry.get("last_v")
 
             entry.clear()
 
             entry["prices"] = prev_prices[-1800:]
+            entry["price_times"] = prev_price_times[-1800:]
             entry["vols"] = prev_vols[-1800:]
             entry["last_v"] = prev_last_v
             entry["last_start_sent_ts"] = now_ts
+
 
             entry["phase"] = "PENDING_START"
             entry["pending_start_ts"] = now_ts
@@ -658,6 +714,50 @@ def cleanup_loop():
 
         time.sleep(600)  # 10 dəq
 
+
+def refresh_tracked_symbols():
+    global tracked_syms
+
+    while True:
+        time.sleep(300)  # 5 dəqiqə
+
+        try:
+            info = client.futures_exchange_info()
+            syms = [
+                s["symbol"] for s in info["symbols"]
+                if s["quoteAsset"] == "USDT"
+                and s["status"] == "TRADING"
+            ]
+
+            if not refresh_vol24_cache():
+                print("⚠️ Volume refresh failed; keeping previous tracked symbols.")
+                continue
+
+            vol_list = [
+                (s, get_24h_volume_cached(s))
+                for s in syms
+            ]
+            new_tracked_syms = {
+                s for s, v in vol_list if v >= MIN24H
+            }
+
+            if not new_tracked_syms:
+                print("⚠️ No qualifying symbols found. Tracked list will be empty.")
+
+            old_count = len(tracked_syms)
+            added = new_tracked_syms - tracked_syms
+            removed = tracked_syms - new_tracked_syms
+
+            tracked_syms = new_tracked_syms
+
+            print(
+                f"🔄 Symbols refreshed: {len(tracked_syms)} tracked, "
+                f"+{len(added)} added, -{len(removed)} removed."
+            )
+            
+        except Exception as e:
+            print("Symbol refresh error:", e)
+
 # ============================================================
 # START STREAM
 # ============================================================
@@ -670,11 +770,15 @@ def start_stream():
     try:
         info = client.futures_exchange_info()
         syms = [s["symbol"] for s in info["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
+        
+        
+        refresh_vol24_cache()
+
         vol_list = [(s, get_24h_volume_cached(s)) for s in syms]
         vol_list = [(s, v) for s, v in vol_list if v >= MIN24H]
 
         vol_list.sort(key=lambda x: x[1], reverse=True)
-        top_syms = [s for s, v in vol_list[:TOP_N]]
+        top_syms = [s for s, v in vol_list]
 
         print(f"✅ Found {len(syms)} USDT futures symbols.")
         print(f"📌 After MIN24H filter: {len(top_syms)}")
@@ -724,7 +828,9 @@ if __name__ == "__main__":
     for _ in range(max(1, ANALYSIS_WORKERS)):
         threading.Thread(target=analysis_worker, daemon=True).start()
 
+
     threading.Thread(target=start_stream, daemon=True).start()
+    threading.Thread(target=refresh_tracked_symbols, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=cleanup_loop, daemon=True).start()
