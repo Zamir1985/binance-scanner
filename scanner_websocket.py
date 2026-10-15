@@ -35,6 +35,7 @@ aggtrade_socket_manager = None
 aggtrade_symbol_socket = {}
 aggtrade_last_msg_by_socket = {}
 aggtrade_subscription_lock = threading.RLock()
+ws_lifecycle_lock = threading.RLock()
 volume_epoch_ts_by_symbol = {}
 telegram_overflow_warned = False
 
@@ -683,35 +684,68 @@ def handle_miniticker(msg):
 # WEBSOCKET MONITOR (FUTURES MULTIPLEX)
 # ============================================================
 
+def _stop_socket_and_wait(twm, socket_key, timeout=12):
+    """Stop one listener and wait for python-binance to remove its registry entry."""
+    running_sockets = getattr(twm, "_socket_running", None)
+    if not isinstance(running_sockets, dict) or socket_key not in running_sockets:
+        return
+
+    twm.stop_socket(socket_key)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if socket_key not in running_sockets:
+            return
+        time.sleep(0.1)
+    raise TimeoutError(f"WebSocket listener did not stop: {socket_key}")
+
+
+def _stop_websocket_manager_and_wait(twm, timeout=15):
+    """Do not create a replacement manager until the old manager thread has exited."""
+    if twm is None:
+        return
+
+    twm.stop()
+    if twm.ident is not None:
+        twm.join(timeout=timeout)
+    if twm.ident is not None and twm.is_alive():
+        raise TimeoutError("Old WebSocket manager did not stop completely")
+
 def _start_aggtrade_sockets(twm: ThreadedWebsocketManager, symbols):
     global aggtrade_subscribed_syms, aggtrade_socket_keys, aggtrade_socket_manager
     global aggtrade_symbol_socket, aggtrade_last_msg_by_socket
     global last_aggtrade_msg_ts, aggtrade_connected_ts
 
-    with aggtrade_subscription_lock:
+    with ws_lifecycle_lock:
         if twm is not ws_manager:
             return 0
 
-        if aggtrade_socket_manager is not twm:
+        desired_symbols = set(symbols)
+        with aggtrade_subscription_lock:
+            if aggtrade_socket_manager is not twm:
+                aggtrade_socket_keys = []
+                aggtrade_subscribed_syms = set()
+                aggtrade_symbol_socket = {}
+                aggtrade_last_msg_by_socket = {}
+                aggtrade_socket_manager = twm
+
+            if desired_symbols == aggtrade_subscribed_syms:
+                return len(desired_symbols)
+            old_socket_keys = list(aggtrade_socket_keys)
+
+        # A refresh must not open replacement listeners while old listeners are
+        # still unwinding in python-binance's event loop.
+        for socket_key in old_socket_keys:
+            _stop_socket_and_wait(twm, socket_key)
+
+        with aggtrade_subscription_lock:
             aggtrade_socket_keys = []
             aggtrade_subscribed_syms = set()
             aggtrade_symbol_socket = {}
             aggtrade_last_msg_by_socket = {}
-            aggtrade_socket_manager = twm
+            last_aggtrade_msg_ts = 0.0
+            aggtrade_connected_ts = time.time()
+            connection_epoch_ts = aggtrade_connected_ts
 
-        desired_symbols = set(symbols)
-        if desired_symbols == aggtrade_subscribed_syms:
-            return len(desired_symbols)
-
-        for socket_key in aggtrade_socket_keys:
-            twm.stop_socket(socket_key)
-        aggtrade_socket_keys = []
-        aggtrade_subscribed_syms = set()
-        aggtrade_symbol_socket = {}
-        aggtrade_last_msg_by_socket = {}
-        last_aggtrade_msg_ts = 0.0
-        aggtrade_connected_ts = time.time()
-        connection_epoch_ts = aggtrade_connected_ts
         for symbol in desired_symbols:
             with state_locks[symbol]:
                 volume_epoch_ts_by_symbol[symbol] = connection_epoch_ts
@@ -725,14 +759,15 @@ def _start_aggtrade_sockets(twm: ThreadedWebsocketManager, symbols):
             )
             if not socket_key:
                 raise RuntimeError("aggTrade WebSocket could not be started")
-            aggtrade_socket_keys.append(socket_key)
             chunk_symbols = {
                 stream.rsplit("@", 1)[0].upper() for stream in stream_chunk
             }
-            aggtrade_last_msg_by_socket[socket_key] = time.time()
-            for symbol in chunk_symbols:
-                aggtrade_symbol_socket[symbol] = socket_key
-            aggtrade_subscribed_syms.update(chunk_symbols)
+            with aggtrade_subscription_lock:
+                aggtrade_socket_keys.append(socket_key)
+                aggtrade_last_msg_by_socket[socket_key] = time.time()
+                for symbol in chunk_symbols:
+                    aggtrade_symbol_socket[symbol] = socket_key
+                aggtrade_subscribed_syms.update(chunk_symbols)
         return len(desired_symbols)
 
 
@@ -815,36 +850,79 @@ def ws_monitor(min_active=10, check_interval=30):
                 )
                 and now - ws_started_ts > 120
             ):
-                print(
-                    f"⚠ WS monitor: {active}/{min_req} price-active, "
-                    f"aggTrade stale={aggtrade_stale}, "
-                    f"stale aggTrade groups={len(stale_aggtrade_sockets)}, "
-                    f"subscription complete={not aggtrade_subscription_incomplete} "
-                    f"— reconnecting WS"
-                )
-
-                try:
-                    if ws_manager:
-                        ws_manager.stop()
-                        time.sleep(2)
-                except:
-                    pass
-
-                try:
-                    twm = ThreadedWebsocketManager(
-                        api_key=BINANCE_API_KEY,
-                        api_secret=BINANCE_API_SECRET
+                with ws_lifecycle_lock:
+                    # Recheck after acquiring the lifecycle lock: a symbol
+                    # refresh may have resolved the stale snapshot meanwhile.
+                    now = time.time()
+                    current_symbols = set(tracked_syms)
+                    current_min_req = (
+                        min(min_active, max(1, len(current_symbols)//3))
+                        if current_symbols else min_active
+                    )
+                    current_active = sum(
+                        1 for symbol in current_symbols
+                        if last_seen.get(symbol, 0) > now - 90
+                    )
+                    current_aggtrade_reference = (
+                        last_aggtrade_msg_ts or aggtrade_connected_ts
+                    )
+                    current_aggtrade_stale = (
+                        bool(current_symbols)
+                        and current_aggtrade_reference > 0
+                        and now - current_aggtrade_reference > AGGTRADE_IDLE_TIMEOUT
+                    )
+                    with aggtrade_subscription_lock:
+                        current_subscription_incomplete = (
+                            bool(current_symbols)
+                            and aggtrade_subscribed_syms != current_symbols
+                        )
+                        current_stale_sockets = [
+                            socket_key for socket_key in aggtrade_socket_keys
+                            if now - aggtrade_last_msg_by_socket.get(
+                                socket_key, aggtrade_connected_ts
+                            ) > AGGTRADE_GROUP_IDLE_TIMEOUT
+                        ]
+                    current_started_ts = aggtrade_connected_ts or START_TIME
+                    still_unhealthy = (
+                        current_symbols
+                        and (
+                            current_active < current_min_req
+                            or current_aggtrade_stale
+                            or current_stale_sockets
+                            or current_subscription_incomplete
+                        )
+                        and now - current_started_ts > 120
                     )
 
-                    twm.start()
-                    ws_manager = twm
+                    if not still_unhealthy:
+                        print("✅ WS refresh completed before recovery; reconnect skipped.")
+                    else:
+                        print(
+                            f"⚠ WS monitor: {current_active}/{current_min_req} price-active, "
+                            f"aggTrade stale={current_aggtrade_stale}, "
+                            f"stale aggTrade groups={len(current_stale_sockets)}, "
+                            f"subscription complete={not current_subscription_incomplete} "
+                            f"— reconnecting WS"
+                        )
+                        try:
+                            old_manager = ws_manager
+                            _stop_websocket_manager_and_wait(old_manager)
+                            ws_manager = None
 
-                    _start_miniticker_socket(twm)
+                            twm = ThreadedWebsocketManager(
+                                api_key=BINANCE_API_KEY,
+                                api_secret=BINANCE_API_SECRET
+                            )
 
-                    print("🔁 WebSocket reconnected")
+                            twm.start()
+                            ws_manager = twm
 
-                except Exception as e:
-                    print("WS reconnect failed:", e)
+                            _start_miniticker_socket(twm)
+
+                            print("🔁 WebSocket reconnected; waiting for incoming data.")
+
+                        except Exception as e:
+                            print("WS reconnect failed:", e)
 
             time.sleep(check_interval)
 
@@ -1030,29 +1108,32 @@ def refresh_tracked_symbols():
             if not new_tracked_syms:
                 print("⚠️ No qualifying symbols found. Tracked list will be empty.")
 
-            old_count = len(tracked_syms)
-            added = new_tracked_syms - tracked_syms
-            removed = tracked_syms - new_tracked_syms
+            # Serialize symbol-list changes with monitor reconnects and socket
+            # replacements so only one thread mutates WebSocket state at a time.
+            with ws_lifecycle_lock:
+                old_count = len(tracked_syms)
+                added = new_tracked_syms - tracked_syms
+                removed = tracked_syms - new_tracked_syms
 
-            for symbol in removed | added:
-                with state_locks[symbol]:
-                    volume_epoch_ts_by_symbol.pop(symbol, None)
-                    entry = state.get(symbol)
-                    if entry is not None:
-                        entry["volume_buckets"] = deque()
+                for symbol in removed | added:
+                    with state_locks[symbol]:
+                        volume_epoch_ts_by_symbol.pop(symbol, None)
+                        entry = state.get(symbol)
+                        if entry is not None:
+                            entry["volume_buckets"] = deque()
 
-            tracked_syms = new_tracked_syms
+                tracked_syms = new_tracked_syms
 
-            if ws_manager is not None and aggtrade_subscribed_syms != new_tracked_syms:
-                try:
-                    _start_aggtrade_sockets(ws_manager, new_tracked_syms)
-                except Exception as e:
-                    print("aggTrade subscription update failed:", e)
+                if ws_manager is not None and aggtrade_subscribed_syms != new_tracked_syms:
+                    try:
+                        _start_aggtrade_sockets(ws_manager, new_tracked_syms)
+                    except Exception as e:
+                        print("aggTrade subscription update failed:", e)
 
-            print(
-                f"🔄 Symbols refreshed: {len(tracked_syms)} tracked, "
-                f"+{len(added)} added, -{len(removed)} removed."
-            )
+                print(
+                    f"🔄 Symbols refreshed: {len(tracked_syms)} tracked, "
+                    f"+{len(added)} added, -{len(removed)} removed."
+                )
             
         except Exception as e:
             print("Symbol refresh error:", e)
@@ -1092,14 +1173,15 @@ def start_stream():
             if not top_syms:
                 raise RuntimeError("No USDT perpetual symbols meet MIN24H")
 
-            tracked_syms = set(top_syms)
-            twm = ThreadedWebsocketManager(
-                api_key=BINANCE_API_KEY,
-                api_secret=BINANCE_API_SECRET
-            )
-            twm.start()
-            ws_manager = twm
-            _start_miniticker_socket(twm)
+            with ws_lifecycle_lock:
+                tracked_syms = set(top_syms)
+                twm = ThreadedWebsocketManager(
+                    api_key=BINANCE_API_KEY,
+                    api_secret=BINANCE_API_SECRET
+                )
+                twm.start()
+                ws_manager = twm
+                _start_miniticker_socket(twm)
 
             threading.Thread(
                 target=warmup_vol24,
